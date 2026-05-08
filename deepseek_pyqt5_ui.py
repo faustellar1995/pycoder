@@ -33,7 +33,7 @@ from PyQt5.QtWidgets import (
     QListWidgetItem,
 )
 
-from deepseek_api import explain_http_error, get_api_key, StreamInterrupted
+from deepseek_api import explain_http_error, get_api_key, resolve_model, StreamInterrupted
 from deepseek_harness import (
     HarnessConfig,
     do_git_commit,
@@ -57,7 +57,7 @@ from prompts_manager import (
     get_all_prompts,
     save_prompts,
 )
-from workspace_tools import WorkspaceToolSession
+from workspace_tools import WorkspaceToolSession, openai_tool_specs
 
 class AskWorker(QThread):
     chunk = pyqtSignal(str)
@@ -478,8 +478,47 @@ class MainWindow(QMainWindow):
         preview_layout.addWidget(QLabel("下一次请求上下文预览"))
         self.preview_context_box = QPlainTextEdit()
         self.preview_context_box.setReadOnly(True)
-        self.preview_context_box.setPlaceholderText("开启 Preview 后可检查下一次请求的 messages。")
+        self.preview_context_box.setPlaceholderText(
+            "开启 Preview 后显示下一次请求的摘要；可用下方开关隐藏不需要的段落（tools 默认关闭）。"
+        )
         preview_layout.addWidget(self.preview_context_box, 1)
+
+        preview_filters = QHBoxLayout()
+        preview_filters.setSpacing(12)
+        preview_filters.addWidget(QLabel("显示："))
+        pm = self.settings.value("preview_show_meta", True)
+        if isinstance(pm, str):
+            pm = pm.lower() in ("1", "true", "yes")
+        self.preview_show_meta_checkbox = QCheckBox("请求参数")
+        self.preview_show_meta_checkbox.setChecked(bool(pm))
+        self.preview_show_meta_checkbox.setToolTip("model、model_mode、temperature、stream")
+        self.preview_show_meta_checkbox.toggled.connect(
+            lambda v: self.settings.setValue("preview_show_meta", bool(v))
+        )
+        pmsg = self.settings.value("preview_show_messages", True)
+        if isinstance(pmsg, str):
+            pmsg = pmsg.lower() in ("1", "true", "yes")
+        self.preview_show_messages_checkbox = QCheckBox("messages")
+        self.preview_show_messages_checkbox.setChecked(bool(pmsg))
+        self.preview_show_messages_checkbox.setToolTip("对话消息数组（通常必看）")
+        self.preview_show_messages_checkbox.toggled.connect(
+            lambda v: self.settings.setValue("preview_show_messages", bool(v))
+        )
+        pt = self.settings.value("preview_show_tools", False)
+        if isinstance(pt, str):
+            pt = pt.lower() in ("1", "true", "yes")
+        self.preview_show_tools_checkbox = QCheckBox("tools")
+        self.preview_show_tools_checkbox.setChecked(bool(pt))
+        self.preview_show_tools_checkbox.setToolTip("函数定义列表，体积大；调 prompt 时可关掉")
+        self.preview_show_tools_checkbox.toggled.connect(
+            lambda v: self.settings.setValue("preview_show_tools", bool(v))
+        )
+        preview_filters.addWidget(self.preview_show_meta_checkbox)
+        preview_filters.addWidget(self.preview_show_messages_checkbox)
+        preview_filters.addWidget(self.preview_show_tools_checkbox)
+        preview_filters.addStretch(1)
+        preview_layout.addLayout(preview_filters)
+
         content_split.addWidget(preview_wrap)
 
         right_layout.addWidget(QLabel("输入"))
@@ -678,6 +717,9 @@ class MainWindow(QMainWindow):
         skills_layout.addWidget(self.skills_list, 1)
         left_tabs.addTab(skills_tab, "Skills")
 
+        # 须在创建 skills_list 之后再连接（初始化早期会调用 _on_tools_toggled，不能在其中刷新预览）
+        self.tools_checkbox.toggled.connect(self.update_next_context_preview)
+
         self.refresh_skills_btn.clicked.connect(lambda: self.refresh_skills_list(force_disk=True))
         self.market_skills_btn.clicked.connect(self.on_open_market)
         self.clear_catalog_cache_btn.clicked.connect(self.on_clear_catalog_cache)
@@ -689,6 +731,18 @@ class MainWindow(QMainWindow):
         self.save_button.clicked.connect(self.on_save_conversation)
         self.input_box.textChanged.connect(self.update_next_context_preview)
         self.preview_checkbox.toggled.connect(self.update_next_context_preview)
+        self.model_combo.currentIndexChanged.connect(self.update_next_context_preview)
+        self.stream_checkbox.toggled.connect(self.update_next_context_preview)
+        self.allow_commands_checkbox.toggled.connect(self.update_next_context_preview)
+        self.web_search_checkbox.toggled.connect(self.update_next_context_preview)
+        self.auto_skill_checkbox.toggled.connect(self.update_next_context_preview)
+        self.workspace_edit.textChanged.connect(self.update_next_context_preview)
+        self.skills_list.itemChanged.connect(self.update_next_context_preview)
+        self.context_list.model().rowsInserted.connect(lambda *a: self.update_next_context_preview())
+        self.context_list.model().rowsRemoved.connect(lambda *a: self.update_next_context_preview())
+        self.preview_show_meta_checkbox.toggled.connect(self.update_next_context_preview)
+        self.preview_show_messages_checkbox.toggled.connect(self.update_next_context_preview)
+        self.preview_show_tools_checkbox.toggled.connect(self.update_next_context_preview)
         self.commit_gen_btn.clicked.connect(self.on_generate_commit_message)
         self.commit_do_btn.clicked.connect(self.on_do_git_commit)
 
@@ -1028,6 +1082,67 @@ class MainWindow(QMainWindow):
             parts.append(addon)
         return "\n\n".join(parts)
 
+    def _build_next_request_messages(self, user_input: str) -> List[Dict[str, str]]:
+        """与点击 Send 时组装的 messages 一致（不修改 self.messages）。"""
+        full_system = self.compose_full_system_prompt(user_input)
+        if not self.messages:
+            base: List[Dict[str, str]] = [{"role": "system", "content": full_system}]
+        else:
+            base = [dict(m) for m in self.messages]
+            if base and base[0].get("role") == "system":
+                base[0] = {**base[0], "content": full_system}
+            else:
+                base.insert(0, {"role": "system", "content": full_system})
+        u = user_input.strip()
+        if u:
+            base.append({"role": "user", "content": u})
+        return base
+
+    def _next_request_preview_payload(self) -> Dict[str, Any]:
+        """下一次 POST 与 deepseek_api / harness 对齐的摘要（便于调 prompt）。"""
+        next_user = self.input_box.toPlainText().strip()
+        msgs = self._build_next_request_messages(next_user)
+        mode = self.model_combo.currentData()
+        mode_str = str(mode or "flash").strip() or "flash"
+        payload: Dict[str, Any] = {
+            "model": resolve_model(mode_str),
+            "model_mode": mode_str,
+            "temperature": 0.7,
+            "stream": self.stream_checkbox.isChecked(),
+            "messages": msgs,
+        }
+        if self.tools_checkbox.isChecked():
+            payload["tools"] = openai_tool_specs(
+                enable_run_command=self.allow_commands_checkbox.isChecked(),
+                enable_web_search=self.web_search_checkbox.isChecked(),
+            )
+            payload["tool_choice"] = "auto"
+        return payload
+
+    def _filtered_preview_payload(self) -> Any:
+        """按预览区下方开关裁剪 JSON，减少刷屏。"""
+        full = self._next_request_preview_payload()
+        show_meta = self.preview_show_meta_checkbox.isChecked()
+        show_msgs = self.preview_show_messages_checkbox.isChecked()
+        show_tools = self.preview_show_tools_checkbox.isChecked()
+        if show_meta and show_msgs and show_tools:
+            return full
+        out: Dict[str, Any] = {}
+        if show_meta:
+            for k in ("model", "model_mode", "temperature", "stream"):
+                if k in full:
+                    out[k] = full[k]
+        if show_msgs:
+            out["messages"] = full["messages"]
+        if show_tools:
+            if "tools" in full:
+                out["tools"] = full["tools"]
+            if "tool_choice" in full:
+                out["tool_choice"] = full["tool_choice"]
+        if not out:
+            return {"_hint": "请至少勾选一项「显示」"}
+        return out
+
     def on_open_prompt_dialog(self):
         dialog = SystemPromptDialog(self)
         if dialog.exec_() == QDialog.Accepted:
@@ -1073,25 +1188,18 @@ class MainWindow(QMainWindow):
         stream = self.stream_checkbox.isChecked()
 
         self.refresh_skills_list()
-        full_system = self.compose_full_system_prompt(user_input)
 
         if preview_enabled:
-            if not self.messages:
-                self.messages = [{"role": "system", "content": full_system}]
-            else:
-                if self.messages[0].get("role") == "system":
-                    self.messages[0]["content"] = full_system
-                else:
-                    self.messages.insert(0, {"role": "system", "content": full_system})
-            self.messages.append({"role": "user", "content": user_input})
-            api_messages = list(self.messages)
+            api_messages = self._build_next_request_messages(user_input)
+            self.messages = [dict(m) for m in api_messages]
         else:
+            full_system = self.compose_full_system_prompt(user_input)
             try:
-                api_messages = self._parse_preview_messages()
+                parsed = self._parse_preview_messages()
             except ValueError as exc:
                 QMessageBox.warning(self, "Invalid preview JSON", str(exc))
                 return
-            self.messages = list(api_messages)
+            self.messages = list(parsed)
             if self.messages and self.messages[0].get("role") == "system":
                 self.messages[0]["content"] = full_system
             else:
@@ -1158,17 +1266,9 @@ class MainWindow(QMainWindow):
 
         self.preview_context_box.setReadOnly(True)
 
-        next_user_input = self.input_box.toPlainText().strip()
-        if self.messages:
-            next_messages = list(self.messages)
-        else:
-            next_messages = [{"role": "system", "content": self.current_system_prompt}]
-
-        if next_user_input:
-            next_messages.append({"role": "user", "content": next_user_input})
-
+        payload = self._filtered_preview_payload()
         self.preview_context_box.setPlainText(
-            json.dumps(next_messages, ensure_ascii=False, indent=2)
+            json.dumps(payload, ensure_ascii=False, indent=2)
         )
 
     def render_chat(self):
@@ -1263,8 +1363,14 @@ class MainWindow(QMainWindow):
         except json.JSONDecodeError as exc:
             raise ValueError(f"JSON parse failed: {exc}")
 
+        if isinstance(data, dict):
+            inner = data.get("messages")
+            if inner is None:
+                raise ValueError('JSON 对象需包含 "messages" 数组（可与 Preview 开启时格式一致）。')
+            data = inner
+
         if not isinstance(data, list):
-            raise ValueError("Preview JSON must be a list of messages.")
+            raise ValueError("messages 必须是 JSON 数组。")
 
         cleaned = []
         for index, item in enumerate(data, start=1):

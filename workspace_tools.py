@@ -1,4 +1,9 @@
-"""本地工作区工具：供 DeepSeek function calling 执行（路径限制在工作区内）。"""
+"""本地工作区工具：供 DeepSeek function calling 执行。
+
+只读工具（read_file、list_directory）：绝对路径默认可访问本机任意可读目录；相对路径仍相对工作区。
+写工具（write_file、search_replace）及 run_command 的 cwd：限制在工作区根与 DEEPSEEK_WORKSPACE_EXTRA_ROOTS。
+glob_file_search / grep_file 仅在遍历意义上限于工作区根（副作用面大）。
+"""
 
 from __future__ import annotations
 
@@ -7,11 +12,38 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 def default_workspace_root() -> Path:
     return Path(os.getenv("DEEPSEEK_WORKSPACE", os.getcwd())).resolve()
+
+
+def parse_extra_workspace_roots() -> Tuple[Path, ...]:
+    """
+    额外允许的根路径（绝对路径），用于访问工作区外的 SDK/输出目录等。
+    环境变量 DEEPSEEK_WORKSPACE_EXTRA_ROOTS：用分号或竖线分隔，例如：
+      Windows: D:\\clib\\pcl-pcl-1.15.1;D:\\bin
+    （不用冒号分隔，避免与盘符 C: 冲突。）
+    """
+    raw = os.getenv("DEEPSEEK_WORKSPACE_EXTRA_ROOTS", "").strip()
+    if not raw:
+        return ()
+    out: List[Path] = []
+    seen: set[str] = set()
+    for segment in raw.replace("|", ";").split(";"):
+        p = segment.strip().strip('"').strip("'")
+        if not p:
+            continue
+        try:
+            resolved = Path(p).expanduser().resolve()
+        except OSError:
+            continue
+        key = str(resolved)
+        if key not in seen:
+            seen.add(key)
+            out.append(resolved)
+    return tuple(out)
 
 
 def openai_tool_specs(
@@ -25,13 +57,18 @@ def openai_tool_specs(
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "读取工作区内单个 UTF-8 文本文件的全部内容。路径为相对工作区根目录。",
+                "description": (
+                    "读取单个 UTF-8 文本文件的全部内容。"
+                    "绝对路径默认可读任意目录；相对路径则相对工作区根。"
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "相对工作区根目录的文件路径，使用正斜杠。",
+                            "description": (
+                                "绝对路径（任意可读位置）或相对工作区根的路径（正斜杠）。"
+                            ),
                         }
                     },
                     "required": ["path"],
@@ -48,7 +85,9 @@ def openai_tool_specs(
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "相对工作区根目录的文件路径。",
+                            "description": (
+                                "相对工作区根目录；或位于 DEEPSEEK_WORKSPACE_EXTRA_ROOTS 中的绝对路径。"
+                            ),
                         },
                         "content": {"type": "string", "description": "完整文件内容。"},
                     },
@@ -60,13 +99,18 @@ def openai_tool_specs(
             "type": "function",
             "function": {
                 "name": "list_directory",
-                "description": "列出工作区内某目录下的文件与子目录名称（非递归）。",
+                "description": (
+                    "列出目录下一层的文件与子目录名称（非递归，类似 dir / ls）。"
+                    "绝对路径默认可列任意目录；相对路径相对工作区根；空字符串表示工作区根。"
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "相对工作区根目录的目录路径，空字符串表示根目录。",
+                            "description": (
+                                "绝对路径，或相对工作区根目录（空字符串表示工作区根）。"
+                            ),
                         }
                     },
                     "required": ["path"],
@@ -81,7 +125,12 @@ def openai_tool_specs(
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string", "description": "相对工作区根目录的文件路径。"},
+                        "path": {
+                            "type": "string",
+                            "description": (
+                                "须在工作区根或 DEEPSEEK_WORKSPACE_EXTRA_ROOTS 内（相对或绝对）。"
+                            ),
+                        },
                         "old_string": {"type": "string", "description": "要被替换的原始片段，必须在文件中唯一存在。"},
                         "new_string": {"type": "string", "description": "替换后的新内容。"},
                     },
@@ -218,21 +267,70 @@ class WorkspaceSandboxError(Exception):
 
 
 class WorkspaceToolSession:
-    """将相对路径解析到单一根目录下并执行工具。"""
+    """将路径解析到工作区根或可选的额外根目录下并执行工具。"""
 
     def __init__(self, root: Optional[Path] = None, *, http_proxy: Optional[str] = None):
         self.root = (root or default_workspace_root()).resolve()
+        self._extra_roots = parse_extra_workspace_roots()
         self._http_proxy = (http_proxy or "").strip() or None
 
-    def _resolve(self, rel: str) -> Path:
+    def _allowed_roots(self) -> Tuple[Path, ...]:
+        return (self.root, *self._extra_roots)
+
+    def _is_under_allowed(self, candidate: Path) -> bool:
+        try:
+            cand = candidate.resolve()
+        except OSError:
+            return False
+        for ar in self._allowed_roots():
+            try:
+                cand.relative_to(ar)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    def _resolve_write(self, rel: str) -> Path:
+        """写入、run_command 的 cwd：必须落在工作区或 DEEPSEEK_WORKSPACE_EXTRA_ROOTS。"""
         if not isinstance(rel, str):
             raise WorkspaceSandboxError("path 必须是字符串")
-        cleaned = rel.replace("\\", "/").strip().lstrip("/")
-        candidate = (self.root / cleaned).resolve()
-        try:
-            candidate.relative_to(self.root)
-        except ValueError as exc:
-            raise WorkspaceSandboxError(f"路径越界（必须在工作区内）: {rel}") from exc
+        cleaned = rel.replace("\\", "/").strip()
+        if not cleaned:
+            candidate = self.root.resolve()
+        else:
+            trial = Path(cleaned)
+            if trial.is_absolute():
+                candidate = trial.expanduser().resolve()
+            else:
+                rel_norm = cleaned.lstrip("/")
+                candidate = (self.root / rel_norm).resolve()
+        if not self._is_under_allowed(candidate):
+            roots_hint = ", ".join(str(r) for r in self._allowed_roots())
+            raise WorkspaceSandboxError(
+                f"路径越界（写入须在「工作区」或 DEEPSEEK_WORKSPACE_EXTRA_ROOTS 内）。当前允许根: {roots_hint} — {rel}"
+            )
+        return candidate
+
+    def _resolve_read(self, rel: str) -> Path:
+        """只读：绝对路径任意可用；相对路径仍限制在工作区与 EXTRA_ROOTS（防 ../ 逃逸）。"""
+        if not isinstance(rel, str):
+            raise WorkspaceSandboxError("path 必须是字符串")
+        cleaned = rel.replace("\\", "/").strip()
+        if not cleaned:
+            return self.root.resolve()
+        trial = Path(cleaned)
+        if trial.is_absolute():
+            try:
+                return trial.expanduser().resolve()
+            except OSError as exc:
+                raise WorkspaceSandboxError(f"路径无效: {rel}") from exc
+        rel_norm = cleaned.lstrip("/")
+        candidate = (self.root / rel_norm).resolve()
+        if not self._is_under_allowed(candidate):
+            roots_hint = ", ".join(str(r) for r in self._allowed_roots())
+            raise WorkspaceSandboxError(
+                f"相对路径越界（须在工作区或 DEEPSEEK_WORKSPACE_EXTRA_ROOTS 内）。允许根: {roots_hint} — {rel}"
+            )
         return candidate
 
     def execute(self, name: str, arguments: str) -> str:
@@ -283,7 +381,7 @@ class WorkspaceToolSession:
             return f"[tool error] 文件系统错误: {exc}"
 
     def _read_file(self, rel: str) -> str:
-        path = self._resolve(rel)
+        path = self._resolve_read(rel)
         if not path.is_file():
             return f"[tool error] 不是文件或不存在: {rel}"
         try:
@@ -297,14 +395,14 @@ class WorkspaceToolSession:
         return text
 
     def _write_file(self, rel: str, content: str) -> str:
-        path = self._resolve(rel)
+        path = self._resolve_write(rel)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8", newline="\n")
         return f"已写入 {rel}（{len(content)} 字符）"
 
     def _list_directory(self, rel: str) -> str:
         rel = rel.strip().replace("\\", "/")
-        path = self.root if not rel else self._resolve(rel)
+        path = self.root if not rel else self._resolve_read(rel)
         if not path.is_dir():
             return f"[tool error] 不是目录或不存在: {rel or '.'}"
         names = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
@@ -315,7 +413,7 @@ class WorkspaceToolSession:
         return "\n".join(lines) if lines else "(空目录)"
 
     def _search_replace(self, rel: str, old: str, new: str) -> str:
-        path = self._resolve(rel)
+        path = self._resolve_write(rel)
         if not path.is_file():
             return f"[tool error] 不是文件或不存在: {rel}"
         text = path.read_text(encoding="utf-8")
@@ -460,7 +558,7 @@ class WorkspaceToolSession:
             cwd_rel = "."
         if not isinstance(cwd_rel, str):
             return "[tool error] cwd 必须是字符串"
-        cwd_path = self._resolve(cwd_rel.strip().replace("\\", "/"))
+        cwd_path = self._resolve_write(cwd_rel.strip().replace("\\", "/"))
         if not cwd_path.is_dir():
             return f"[tool error] cwd 不是目录: {cwd_rel}"
 

@@ -24,9 +24,10 @@ from workspace_tools import WorkspaceToolSession, openai_tool_specs
 
 def tools_system_hint(*, include_run_command: bool, include_web_search: bool = True) -> str:
     parts = [
-        "你可以调用工具在「工作区」内自动完成本地修改与验证：先用 list_directory / glob_file_search 定位，"
-        "grep_file 按内容搜索（支持正则），read_file 阅读，小改动用 search_replace，新建或大段改写用 write_file；"
-        "路径均为相对工作区根目录的正斜杠路径，禁止越界。",
+        "你可以调用工具完成本地查看与修改：read_file 与 list_directory 对「绝对路径」默认可读/可列本机任意目录（无副作用，类似 type/dir）；"
+        "相对路径仍相对工作区根。write_file、search_replace 及 run_command 的 cwd 仅允许工作区根或环境变量 "
+        "DEEPSEEK_WORKSPACE_EXTRA_ROOTS（分号分隔的额外根，用于写入 D:/bin 等）。"
+        "glob_file_search 与 grep_file 仅扫描工作区根。",
     ]
     if include_web_search:
         parts.append(
