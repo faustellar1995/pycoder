@@ -34,6 +34,7 @@ from PyQt5.QtWidgets import (
 )
 
 from deepseek_api import explain_http_error, get_api_key, resolve_model, StreamInterrupted
+from markdown_renderer import markdown_to_html
 from deepseek_harness import (
     HarnessConfig,
     do_git_commit,
@@ -418,6 +419,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DeepSeek Multi-turn Chat with System Prompt")
+        self.setAcceptDrops(True)
         self.resize(900, 750)
 
         self.worker = None
@@ -463,7 +465,25 @@ class MainWindow(QMainWindow):
         self.new_session_btn.setToolTip("新建会话")
         self.session_tabs.setCornerWidget(self.new_session_btn, Qt.TopRightCorner)
 
-        right_layout.addWidget(QLabel("对话结果"))
+        # ── Markdown 渲染开关 ────────────────────────────────────────────
+        result_header = QHBoxLayout()
+        result_header.addWidget(QLabel("对话结果"))
+        self.render_md_checkbox = QCheckBox("Markdown 渲染")
+        md_val = self.settings.value("render_markdown", True)
+        if isinstance(md_val, str):
+            md_val = md_val.lower() in ("1", "true", "yes")
+        self.render_md_checkbox.setChecked(bool(md_val))
+        self.render_md_checkbox.setToolTip("关闭后显示原始 Markdown 文本（可选，便于调试格式）。")
+        self.render_md_checkbox.toggled.connect(
+            lambda v: (
+                self.settings.setValue("render_markdown", bool(v)),
+                self.render_chat(),
+            )
+        )
+        result_header.addWidget(self.render_md_checkbox)
+        result_header.addStretch(1)
+        right_layout.addLayout(result_header)
+
         content_split = QSplitter(Qt.Horizontal)
         right_layout.addWidget(content_split, 1)
 
@@ -981,6 +1001,33 @@ class MainWindow(QMainWindow):
         nxt = (cur + delta) % n
         self.session_tabs.setCurrentIndex(nxt)
 
+    # ── Drag & Drop: 拖拽文件/目录到窗口加入上下文 ─────────────────────
+    def dragEnterEvent(self, event):
+        """Accept drag if it carries file URLs."""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        """Required to show the drop indicator."""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        """Extract local file/directory paths and add to context."""
+        added = 0
+        for url in event.mimeData().urls():
+            local_path = url.toLocalFile()
+            if not local_path:
+                continue
+            p = Path(local_path)
+            if not p.exists():
+                continue
+            self._add_context_path(p)
+            added += 1
+        event.acceptProposedAction()
+        if added > 0:
+            self.statusBar().showMessage(f"已添加 {added} 项到上下文", 3000)
+
     def on_ai_commit(self) -> None:
         # deprecated (kept for backward references)
         self.on_generate_commit_message()
@@ -1284,7 +1331,36 @@ class MainWindow(QMainWindow):
             sections.append(self._bubble_html("assistant", typing_text, pending=True))
 
         html_text = "".join([
-            "<html><body style='font-family:Segoe UI,Microsoft YaHei,sans-serif; padding:12px; background:#f5f6f8;'>",
+            "<html><head><style>",
+            "body{font-family:Segoe UI,Microsoft YaHei,sans-serif;padding:12px;background:#f5f6f8;font-size:14px;line-height:1.6;}",
+            # Markdown content styling
+            ".md-content h1{font-size:1.4em;margin:0.5em 0 0.3em;border-bottom:1px solid #e0e0e0;padding-bottom:4px;}",
+            ".md-content h2{font-size:1.2em;margin:0.4em 0 0.25em;color:#1f2937;}",
+            ".md-content h3{font-size:1.1em;margin:0.3em 0 0.2em;}",
+            ".md-content h4{font-size:1.0em;margin:0.25em 0 0.15em;}",
+            ".md-content p{margin:0.4em 0;}",
+            # Code blocks
+            ".md-content pre{background:#1e1e2e;color:#cdd6f4;padding:10px 14px;border-radius:8px;overflow-x:auto;font-family:Consolas,'Courier New',monospace;font-size:13px;margin:0.5em 0;border:1px solid #313244;white-space:pre-wrap;word-wrap:break-word;}",
+            ".md-content pre code{background:transparent;padding:0;border-radius:0;color:inherit;font-size:inherit;}",
+            ".md-content code{background:#e8e8ee;padding:1px 5px;border-radius:4px;font-family:Consolas,'Courier New',monospace;font-size:13px;color:#c7254e;border:1px solid #ddd;}",
+            # Blockquotes
+            ".md-content blockquote{border-left:4px solid #a0aec0;padding:4px 0 4px 14px;margin:0.5em 0;color:#4a5568;background:#f0f4f8;border-radius:0 6px 6px 0;}",
+            # Lists
+            ".md-content ul,.md-content ol{margin:0.3em 0;padding-left:1.6em;}",
+            ".md-content li{margin:0.15em 0;}",
+            # Horizontal rule
+            ".md-content hr{border:none;border-top:2px solid #e0e0e0;margin:0.8em 0;}",
+            # Links
+            ".md-content a{color:#2563eb;text-decoration:none;}",
+            ".md-content a:hover{text-decoration:underline;}",
+            # Images
+            ".md-content img{max-width:100%;height:auto;border-radius:6px;margin:0.5em 0;}",
+            # Tables
+            ".md-content table{border-collapse:collapse;margin:0.5em 0;width:100%;}",
+            ".md-content th,.md-content td{border:1px solid #d0d0d0;padding:6px 10px;text-align:left;}",
+            ".md-content th{background:#eef2f7;font-weight:600;}",
+            ".md-content tr:nth-child(even){background:#f8fafc;}",
+            "</style></head><body>",
             "".join(sections) if sections else "<p style='color:#7a7a7a;'>No messages yet.</p>",
             "</body></html>",
         ])
@@ -1292,8 +1368,6 @@ class MainWindow(QMainWindow):
         self.chat_output.moveCursor(QTextCursor.End)
 
     def _bubble_html(self, role: str, content: str, pending: bool = False) -> str:
-        safe = html.escape(content).replace("\n", "<br>")
-
         if role == "user":
             label = "You"
             row_align = "right"
@@ -1305,12 +1379,20 @@ class MainWindow(QMainWindow):
             bubble_bg = "#ffffff"
             text_color = "#111827"
 
+        # Pending (streaming) text uses plain escaping to avoid partial-Markdown glitches
+        if pending:
+            body = html.escape(content).replace("\n", "<br>")
+        elif self.render_md_checkbox.isChecked():
+            body = markdown_to_html(content)
+        else:
+            body = html.escape(content).replace("\n", "<br>")
+
         pending_badge = " <span style='color:#6b7280;'>(typing)</span>" if pending else ""
         return (
             f"<div style='text-align:{row_align}; margin:8px 0;'>"
             f"<div style='display:inline-block; max-width:78%; text-align:left;'>"
             f"<div style='font-size:12px; color:#6b7280; margin-bottom:4px;'>{label}{pending_badge}</div>"
-            f"<div style='background:{bubble_bg}; color:{text_color}; border:1px solid #e5e7eb; border-radius:12px; padding:10px 12px; line-height:1.5;'>{safe}</div>"
+            f"<div style='background:{bubble_bg}; color:{text_color}; border:1px solid #e5e7eb; border-radius:12px; padding:10px 12px; line-height:1.5;'>{body}</div>"
             "</div>"
             "</div>"
         )
