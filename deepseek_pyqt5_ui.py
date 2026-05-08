@@ -33,7 +33,7 @@ from PyQt5.QtWidgets import (
     QListWidgetItem,
 )
 
-from deepseek_api import explain_http_error, get_api_key, resolve_model, StreamInterrupted
+from deepseek_api import chat_completion, explain_http_error, get_api_key, resolve_model, StreamInterrupted
 from markdown_renderer import markdown_to_html
 from deepseek_harness import (
     HarnessConfig,
@@ -64,6 +64,7 @@ class AskWorker(QThread):
     chunk = pyqtSignal(str)
     done = pyqtSignal(str)
     failed = pyqtSignal(str)
+    interrupted = pyqtSignal()
 
     def __init__(
         self,
@@ -119,7 +120,7 @@ class AskWorker(QThread):
             )
             self.done.emit(answer)
         except StreamInterrupted:
-            self.failed.emit("[Stream interrupted by user]")
+            self.interrupted.emit()
         except urllib.error.HTTPError as exc:
             self.failed.emit(explain_http_error(exc))
         except urllib.error.URLError as exc:
@@ -415,6 +416,87 @@ class SkillMarketDialog(QDialog):
         QMessageBox.information(self, "完成", f"已安装到:\n{dest}")
 
 
+SMART_SAVE_FILENAME_SYSTEM = (
+    "你只根据下面给出的对话片段，输出一行「文件主名」（不要扩展名、路径、引号或任何解释）。"
+    "用简短中文或英文描述对话主题，长度不超过 40 字符；仅输出这一行，无其他文字。"
+)
+
+# 仅用于请求模型命名：截断对话文本以控制 token（不可在 UI 编辑）
+SMART_SAVE_TRANSCRIPT_MAX_CHARS = 20000
+
+
+def _filename_stem_from_llm_reply(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    line = text.splitlines()[0].strip()
+    line = line.strip("\"'[]「」")
+    lower = line.lower()
+    if lower.endswith(".json"):
+        line = line[:-5]
+    return _sanitize_filename_component(line)[:80]
+
+
+def _flatten_messages_for_transcript(messages: List[Dict[str, Any]]) -> str:
+    parts: List[str] = []
+    for m in messages:
+        role = str(m.get("role", "?"))
+        content = m.get("content")
+        if not isinstance(content, str):
+            content = json.dumps(content, ensure_ascii=False) if content is not None else ""
+        parts.append(f"### {role}\n{content}")
+    return "\n\n".join(parts)
+
+
+def _sanitize_filename_component(name: str) -> str:
+    name = name.strip()
+    for c in '<>:"/\\|?*\n\r\t':
+        name = name.replace(c, "_")
+    return name[:120]
+
+
+class SmartFilenameWorker(QThread):
+    """仅请求模型输出一行适合作为文件名的主题串（不生成摘要）。"""
+
+    done = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model_mode: str,
+        transcript: str,
+        proxy_url: Optional[str] = None,
+    ):
+        super().__init__()
+        self.api_key = api_key
+        self.model_mode = model_mode
+        self.transcript = transcript
+        self.proxy_url = proxy_url
+
+    def run(self) -> None:
+        try:
+            messages = [
+                {"role": "system", "content": SMART_SAVE_FILENAME_SYSTEM},
+                {
+                    "role": "user",
+                    "content": "对话片段（过长时仅含开头部分，仅供命名参考）：\n\n" + self.transcript,
+                },
+            ]
+            reply = chat_completion(
+                self.api_key,
+                messages,
+                model_mode=self.model_mode,
+                temperature=0.2,
+                timeout=120,
+                proxy_url=self.proxy_url,
+            )
+            self.done.emit(reply)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -424,6 +506,8 @@ class MainWindow(QMainWindow):
 
         self.worker = None
         self.commit_worker = None
+        self.smart_save_worker = None
+        self._smart_save_pending: Optional[Dict[str, Any]] = None
         self.messages = []
         self.current_system_prompt = "You are a helpful assistant."
         self.pending_stream_text = ""
@@ -554,11 +638,14 @@ class MainWindow(QMainWindow):
         self.clear_history_button = QPushButton("Clear History")
         self.load_button = QPushButton("Load")
         self.save_button = QPushButton("Save")
+        self.smart_save_button = QPushButton("Smart Save")
+        self.smart_save_button.setToolTip("由模型根据对话命名并保存到 logs（无前缀摘要）")
         buttons_row.addWidget(self.ask_button)
         buttons_row.addWidget(self.stop_button)
         buttons_row.addWidget(self.clear_history_button)
         buttons_row.addWidget(self.load_button)
         buttons_row.addWidget(self.save_button)
+        buttons_row.addWidget(self.smart_save_button)
         buttons_row.addStretch(1)
         right_layout.addLayout(buttons_row)
 
@@ -749,6 +836,7 @@ class MainWindow(QMainWindow):
         self.clear_history_button.clicked.connect(self.on_clear_history)
         self.load_button.clicked.connect(self.on_load_conversation)
         self.save_button.clicked.connect(self.on_save_conversation)
+        self.smart_save_button.clicked.connect(self.on_smart_save)
         self.input_box.textChanged.connect(self.update_next_context_preview)
         self.preview_checkbox.toggled.connect(self.update_next_context_preview)
         self.model_combo.currentIndexChanged.connect(self.update_next_context_preview)
@@ -1281,12 +1369,25 @@ class MainWindow(QMainWindow):
         self.worker.chunk.connect(self.on_chunk)
         self.worker.done.connect(self.on_done)
         self.worker.failed.connect(self.on_failed)
+        self.worker.interrupted.connect(self.on_interrupted)
         self.worker.finished.connect(self.on_worker_finished)
         self.worker.start()
 
     def on_chunk(self, text: str):
         self.pending_stream_text += text
         self.render_chat()
+
+    def on_interrupted(self):
+        """Stop：保留已流式产出或本轮已返回的正文，写入 messages，供后续轮次使用。"""
+        self.awaiting_response = False
+        partial = (self.pending_stream_text or "").strip()
+        if partial:
+            self.messages.append({"role": "assistant", "content": partial + "\n\n[已中断]"})
+        else:
+            self.messages.append({"role": "assistant", "content": "[已中断]"})
+        self.pending_stream_text = ""
+        self.render_chat()
+        self.update_next_context_preview()
 
     def on_done(self, full_answer: str):
         self.messages.append({"role": "assistant", "content": full_answer})
@@ -1548,6 +1649,98 @@ class MainWindow(QMainWindow):
         self.awaiting_response = False
         self.render_chat()
         self.update_next_context_preview()
+
+    def _messages_source_like_save(self) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+        """与 Save 相同的消息来源。"""
+        if self.preview_checkbox.isChecked():
+            if not self.messages:
+                return None, "empty"
+            return list(self.messages), None
+        try:
+            return self._parse_preview_messages(), None
+        except ValueError as exc:
+            return None, str(exc)
+
+    def _unique_path_in_logs(self, stem: str, stamp: str) -> Path:
+        base = f"{stem}_{stamp}.json"
+        path = self.logs_dir / base
+        counter = 1
+        while path.exists():
+            path = self.logs_dir / f"{stem}_{stamp}_{counter:02d}.json"
+            counter += 1
+        return path
+
+    def on_smart_save(self) -> None:
+        if self.smart_save_worker and self.smart_save_worker.isRunning():
+            return
+
+        msgs, err = self._messages_source_like_save()
+        if err == "empty":
+            QMessageBox.information(self, "Nothing to save", "No conversation to save.")
+            return
+        if err:
+            QMessageBox.warning(self, "Invalid preview JSON", err)
+            return
+        if not msgs:
+            QMessageBox.information(self, "Nothing to save", "No conversation to save.")
+            return
+
+        transcript = _flatten_messages_for_transcript(msgs)
+        transcript_for_api = transcript[:SMART_SAVE_TRANSCRIPT_MAX_CHARS]
+
+        try:
+            api_key = get_api_key()
+        except ValueError as exc:
+            QMessageBox.critical(self, "DS_KEY missing", str(exc))
+            return
+
+        self._smart_save_pending = {"messages": msgs}
+        proxy = self.model_proxy_addr.text().strip() if self.model_proxy_checkbox.isChecked() else None
+        self.smart_save_button.setEnabled(False)
+        self.smart_save_worker = SmartFilenameWorker(
+            api_key=api_key,
+            model_mode=str(self.model_combo.currentData() or "flash"),
+            transcript=transcript_for_api,
+            proxy_url=proxy,
+        )
+        self.smart_save_worker.done.connect(self._on_smart_save_filename_ok)
+        self.smart_save_worker.failed.connect(self._on_smart_save_fail)
+        self.smart_save_worker.finished.connect(self._on_smart_save_worker_finished)
+        self.smart_save_worker.start()
+        self.statusBar().showMessage("Smart Save：正在生成文件名…")
+
+    def _on_smart_save_filename_ok(self, raw_reply: str) -> None:
+        pending = self._smart_save_pending
+        if not pending:
+            return
+
+        stem = _filename_stem_from_llm_reply(raw_reply) or "conversation"
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = self._unique_path_in_logs(stem, stamp)
+
+        payload = {
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "title": stem,
+            "system_prompt": self.current_system_prompt,
+            "messages": pending["messages"],
+        }
+
+        try:
+            self._write_payload(path, payload)
+            QMessageBox.information(self, "Saved", f"已保存:\n{path.resolve()}")
+            self.statusBar().showMessage(f"Smart Save → {path.name}", 5000)
+        except Exception as exc:
+            QMessageBox.warning(self, "Save failed", str(exc))
+
+        self._smart_save_pending = None
+
+    def _on_smart_save_fail(self, message: str) -> None:
+        self._smart_save_pending = None
+        QMessageBox.warning(self, "Smart Save 失败", message)
+        self.statusBar().showMessage("Smart Save 失败", 5000)
+
+    def _on_smart_save_worker_finished(self) -> None:
+        self.smart_save_button.setEnabled(True)
 
 
 def main() -> int:
