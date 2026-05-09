@@ -14,6 +14,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import subprocess
 
 from deepseek_api import (
+    API_URL,
+    PROVIDER_DEEPSEEK,
     StreamInterrupted,
     chat_completion,
     chat_completion_stream,
@@ -53,6 +55,8 @@ class HarnessConfig:
     enable_web_search: bool = True
     stream: bool = True
     proxy_url: Optional[str] = None
+    api_url: str = API_URL
+    provider: str = PROVIDER_DEEPSEEK
 
 
 def run_harness(
@@ -87,6 +91,8 @@ def run_harness(
             timeout=timeout,
             should_stop=should_stop,
             proxy_url=config.proxy_url,
+            api_url=config.api_url,
+            provider=config.provider,
             on_stream_token=on_stream_token,
             stream_tokens=config.stream,
         )
@@ -102,6 +108,8 @@ def run_harness(
             timeout=timeout,
             should_stop=should_stop,
             proxy_url=config.proxy_url,
+            api_url=config.api_url,
+            provider=config.provider,
         ):
             full.append(token)
             if on_stream_token:
@@ -115,6 +123,8 @@ def run_harness(
         temperature=temperature,
         timeout=timeout,
         proxy_url=config.proxy_url,
+        api_url=config.api_url,
+        provider=config.provider,
     )
 
 
@@ -174,6 +184,8 @@ def generate_git_commit_message(
     model_mode: str,
     workspace: Path,
     proxy_url: Optional[str] = None,
+    api_url: str = API_URL,
+    provider: str = PROVIDER_DEEPSEEK,
     temperature: float = 0.2,
     timeout: int = 180,
     max_diff_chars: int = 180_000,
@@ -221,6 +233,8 @@ def generate_git_commit_message(
         temperature=temperature,
         timeout=timeout,
         proxy_url=proxy_url,
+        api_url=api_url,
+        provider=provider,
     )
     subject, body = _split_commit_message(msg)
     if not subject:

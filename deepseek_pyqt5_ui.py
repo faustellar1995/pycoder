@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt5.QtCore import QThread, Qt, pyqtSignal, QSettings
 from PyQt5.QtGui import QTextCursor
@@ -33,7 +33,19 @@ from PyQt5.QtWidgets import (
     QListWidgetItem,
 )
 
-from deepseek_api import chat_completion, explain_http_error, get_api_key, resolve_model, StreamInterrupted
+from deepseek_api import (
+    API_URL,
+    PROVIDER_DEEPSEEK,
+    PROVIDER_KIMI,
+    PROVIDER_OLLAMA,
+    chat_completion,
+    check_available,
+    effective_temperature_for_resolved_model,
+    explain_http_error,
+    resolve_chat_endpoint,
+    resolve_model,
+    StreamInterrupted,
+)
 from markdown_renderer import markdown_to_html
 from deepseek_harness import (
     HarnessConfig,
@@ -79,6 +91,8 @@ class AskWorker(QThread):
         allow_run_command: bool = True,
         enable_web_search: bool = True,
         proxy_url: Optional[str] = None,
+        api_url: str = API_URL,
+        provider: str = PROVIDER_DEEPSEEK,
     ):
         super().__init__()
         self.api_key = api_key
@@ -91,6 +105,8 @@ class AskWorker(QThread):
         self.allow_run_command = allow_run_command
         self.enable_web_search = enable_web_search
         self.proxy_url = proxy_url
+        self.api_url = api_url
+        self.provider = provider
         self._should_stop = False
 
     def stop(self):
@@ -109,6 +125,8 @@ class AskWorker(QThread):
                 enable_web_search=self.enable_web_search,
                 stream=self.stream,
                 proxy_url=self.proxy_url,
+                api_url=self.api_url,
+                provider=self.provider,
             )
             answer = run_harness(
                 api_key=self.api_key,
@@ -133,12 +151,23 @@ class CommitWorker(QThread):
     done = pyqtSignal(str)
     failed = pyqtSignal(str)
 
-    def __init__(self, *, api_key: str, model_mode: str, workspace: Path, proxy_url: Optional[str] = None):
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model_mode: str,
+        workspace: Path,
+        proxy_url: Optional[str] = None,
+        api_url: str = API_URL,
+        provider: str = PROVIDER_DEEPSEEK,
+    ):
         super().__init__()
         self.api_key = api_key
         self.model_mode = model_mode
         self.workspace = workspace
         self.proxy_url = proxy_url
+        self.api_url = api_url
+        self.provider = provider
 
     def run(self):
         try:
@@ -147,6 +176,8 @@ class CommitWorker(QThread):
                 model_mode=self.model_mode,
                 workspace=self.workspace,
                 proxy_url=self.proxy_url,
+                api_url=self.api_url,
+                provider=self.provider,
             )
             payload = {"subject": subject, "body": body, "log": log}
             self.done.emit(json.dumps(payload, ensure_ascii=False))
@@ -468,12 +499,16 @@ class SmartFilenameWorker(QThread):
         model_mode: str,
         transcript: str,
         proxy_url: Optional[str] = None,
+        api_url: str = API_URL,
+        provider: str = PROVIDER_DEEPSEEK,
     ):
         super().__init__()
         self.api_key = api_key
         self.model_mode = model_mode
         self.transcript = transcript
         self.proxy_url = proxy_url
+        self.api_url = api_url
+        self.provider = provider
 
     def run(self) -> None:
         try:
@@ -491,8 +526,40 @@ class SmartFilenameWorker(QThread):
                 temperature=0.2,
                 timeout=120,
                 proxy_url=self.proxy_url,
+                api_url=self.api_url,
+                provider=self.provider,
             )
             self.done.emit(reply)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class ModelsRefreshWorker(QThread):
+    """后台调用 check_available，拉取 DeepSeek / Kimi / 本地 Ollama 模型列表。"""
+
+    done = pyqtSignal(list, list)
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        *,
+        proxy_url: Optional[str] = None,
+        timeout: int = 45,
+        ollama_ui_base: Optional[str] = None,
+    ):
+        super().__init__()
+        self.proxy_url = proxy_url
+        self.timeout = timeout
+        self.ollama_ui_base = ollama_ui_base
+
+    def run(self) -> None:
+        try:
+            entries, notes = check_available(
+                proxy_url=self.proxy_url,
+                timeout=self.timeout,
+                ollama_ui_base=self.ollama_ui_base,
+            )
+            self.done.emit(entries, notes)
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -507,6 +574,7 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.commit_worker = None
         self.smart_save_worker = None
+        self._models_refresh_worker = None
         self._smart_save_pending: Optional[Dict[str, Any]] = None
         self.messages = []
         self.current_system_prompt = "You are a helpful assistant."
@@ -662,9 +730,17 @@ class MainWindow(QMainWindow):
         row_model = QHBoxLayout()
         row_model.addWidget(QLabel("Model"))
         self.model_combo = QComboBox()
-        self.model_combo.addItem("Flash (deepseek-v4-flash)", "flash")
-        self.model_combo.addItem("Pro (deepseek-v4-pro)", "pro")
+        self.model_combo.setToolTip(
+            "来自 DeepSeek / Kimi GET /v1/models 与本地 Ollama（/api/tags）；标注 [DS]/[Kimi]/[Ollama]。"
+            "Kimi 需 KIMI_KEY；DeepSeek 需 DS_KEY；Ollama 无需密钥（默认 http://127.0.0.1:11434，可用下方地址或环境变量"
+            " OLLAMA_HOST / OLLAMA_API_BASE 覆盖）。点击「刷新模型」合并列表。"
+        )
+        self.refresh_models_btn = QPushButton("刷新模型")
+        self.refresh_models_btn.setToolTip(
+            "合并 DeepSeek、Kimi 的 GET /v1/models 与 Ollama 的已安装模型；尊重「代理」开关（访问本机 Ollama 时可关闭代理）。"
+        )
         row_model.addWidget(self.model_combo, 1)
+        row_model.addWidget(self.refresh_models_btn)
         model_layout.addLayout(row_model)
 
         row_flags = QHBoxLayout()
@@ -688,6 +764,21 @@ class MainWindow(QMainWindow):
         row_flags.addStretch(1)
         model_layout.addLayout(row_flags)
         model_layout.addWidget(self.model_proxy_addr)
+
+        row_ollama = QHBoxLayout()
+        row_ollama.addWidget(QLabel("Ollama 地址"))
+        self.ollama_base_edit = QLineEdit()
+        self.ollama_base_edit.setPlaceholderText(
+            "留空 → OLLAMA_HOST / OLLAMA_API_BASE / 默认 http://127.0.0.1:11434"
+        )
+        ob_saved = self.settings.value("ollama_api_base", "")
+        self.ollama_base_edit.setText(str(ob_saved) if ob_saved is not None else "")
+        self.ollama_base_edit.setToolTip(
+            "本地 Ollama HTTP 根地址（无路径）。用于扫描模型与选中 [Ollama] 时的对话请求。"
+        )
+        self.ollama_base_edit.textChanged.connect(lambda t: self.settings.setValue("ollama_api_base", t))
+        row_ollama.addWidget(self.ollama_base_edit, 1)
+        model_layout.addLayout(row_ollama)
 
         self.prompt_button = QPushButton("System Prompts…")
         self.prompt_button.clicked.connect(self.on_open_prompt_dialog)
@@ -840,6 +931,9 @@ class MainWindow(QMainWindow):
         self.input_box.textChanged.connect(self.update_next_context_preview)
         self.preview_checkbox.toggled.connect(self.update_next_context_preview)
         self.model_combo.currentIndexChanged.connect(self.update_next_context_preview)
+        self.model_combo.currentIndexChanged.connect(self._persist_model_choice)
+        self.model_combo.currentIndexChanged.connect(self.render_chat)
+        self.refresh_models_btn.clicked.connect(self.on_refresh_models)
         self.stream_checkbox.toggled.connect(self.update_next_context_preview)
         self.allow_commands_checkbox.toggled.connect(self.update_next_context_preview)
         self.web_search_checkbox.toggled.connect(self.update_next_context_preview)
@@ -854,14 +948,17 @@ class MainWindow(QMainWindow):
         self.commit_gen_btn.clicked.connect(self.on_generate_commit_message)
         self.commit_do_btn.clicked.connect(self.on_do_git_commit)
 
+        self._load_cached_models_into_combo()
         self.render_chat()
         self.update_next_context_preview()
         self.refresh_skills_list()
 
-        self._init_sessions()
-        self.new_session_btn.clicked.connect(self.new_session)
+        # 必须先连接 currentChanged，再 _init_sessions；否则首个 Tab 创建时不会触发同步，
+        # _active_session_index 会一直为 -1，切换会话时无法保存消息，表现为聊天记录与预览 JSON 错乱。
         self.session_tabs.currentChanged.connect(self.on_session_changed)
         self.session_tabs.tabCloseRequested.connect(self.close_session)
+        self._init_sessions()
+        self.new_session_btn.clicked.connect(self.new_session)
 
         # Chrome-like 会话快捷键
         QShortcut("Ctrl+T", self, activated=self.new_session)
@@ -874,6 +971,212 @@ class MainWindow(QMainWindow):
         if not text:
             return Path.cwd().resolve()
         return Path(text).expanduser().resolve()
+
+    def current_provider(self) -> str:
+        d = self.model_combo.currentData()
+        if isinstance(d, (tuple, list)) and len(d) >= 1:
+            p = str(d[0])
+            if p in ("__placeholder__", ""):
+                return PROVIDER_DEEPSEEK
+            return p
+        return PROVIDER_DEEPSEEK
+
+    def current_model_mode(self) -> str:
+        d = self.model_combo.currentData()
+        if isinstance(d, (tuple, list)) and len(d) >= 2:
+            return str(d[1])
+        return ""
+
+    def _model_choice_ready(self) -> bool:
+        d = self.model_combo.currentData()
+        if not isinstance(d, (tuple, list)) or len(d) < 2:
+            return False
+        if str(d[0]) in ("__placeholder__", ""):
+            return False
+        return bool(str(d[1]).strip())
+
+    def _persist_model_choice(self, *_args: Any) -> None:
+        d = self.model_combo.currentData()
+        if isinstance(d, (tuple, list)) and len(d) >= 2 and str(d[0]) not in ("__placeholder__", ""):
+            self.settings.setValue("last_model_provider", str(d[0]))
+            self.settings.setValue("last_model_id", str(d[1]))
+
+    def _find_model_row(self, choice: Tuple[str, str]) -> int:
+        for i in range(self.model_combo.count()):
+            d = self.model_combo.itemData(i)
+            if not isinstance(d, (tuple, list)) or len(d) < 2:
+                continue
+            if str(d[0]) == str(choice[0]) and str(d[1]) == str(choice[1]):
+                return i
+        return -1
+
+    def _apply_model_entries(self, entries: List[Tuple[str, str]], *, persist: bool = True) -> None:
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        for prov, mid in entries:
+            if prov == PROVIDER_DEEPSEEK:
+                tag = "DS"
+            elif prov == PROVIDER_KIMI:
+                tag = "Kimi"
+            elif prov == PROVIDER_OLLAMA:
+                tag = "Ollama"
+            else:
+                tag = str(prov)[:8]
+            self.model_combo.addItem(f"[{tag}] {mid}", (prov, mid))
+        self.model_combo.blockSignals(False)
+        if persist:
+            self.settings.setValue(
+                "available_models_cache_v1",
+                json.dumps(entries, ensure_ascii=False),
+            )
+        if self.model_combo.count() > 0:
+            self.model_combo.setCurrentIndex(0)
+
+    def _restore_last_model_choice(self) -> None:
+        lp = self.settings.value("last_model_provider", "")
+        lm = self.settings.value("last_model_id", "")
+        if not str(lp).strip() or not str(lm).strip():
+            return
+        idx = self._find_model_row((str(lp), str(lm)))
+        if idx >= 0:
+            self.model_combo.setCurrentIndex(idx)
+
+    def _load_cached_models_into_combo(self) -> None:
+        raw = self.settings.value("available_models_cache_v1", "")
+        if not raw or not str(raw).strip():
+            self.model_combo.addItem("— 点击「刷新模型」—", ("__placeholder__", ""))
+            return
+        try:
+            data = json.loads(str(raw))
+        except Exception:
+            self.model_combo.addItem("— 点击「刷新模型」—", ("__placeholder__", ""))
+            return
+        if not isinstance(data, list) or not data:
+            self.model_combo.addItem("— 点击「刷新模型」—", ("__placeholder__", ""))
+            return
+        entries: List[Tuple[str, str]] = []
+        for item in data:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                entries.append((str(item[0]), str(item[1])))
+        if not entries:
+            self.model_combo.addItem("— 点击「刷新模型」—", ("__placeholder__", ""))
+            return
+        self._apply_model_entries(entries, persist=False)
+        self._restore_last_model_choice()
+
+    def on_refresh_models(self) -> None:
+        if self._models_refresh_worker and self._models_refresh_worker.isRunning():
+            return
+        proxy = self.model_proxy_addr.text().strip() if self.model_proxy_checkbox.isChecked() else None
+        self.refresh_models_btn.setEnabled(False)
+        self.statusBar().showMessage("正在拉取可用模型…")
+        ollama_ui = self.ollama_base_edit.text().strip() or None
+        self._models_refresh_worker = ModelsRefreshWorker(
+            proxy_url=proxy,
+            timeout=60,
+            ollama_ui_base=ollama_ui,
+        )
+        self._models_refresh_worker.done.connect(self._on_models_refresh_done)
+        self._models_refresh_worker.failed.connect(self._on_models_refresh_failed)
+        self._models_refresh_worker.finished.connect(self._on_models_refresh_finished)
+        self._models_refresh_worker.start()
+
+    def _cached_model_entries(self) -> List[Tuple[str, str]]:
+        raw = self.settings.value("available_models_cache_v1", "")
+        if not raw or not str(raw).strip():
+            return []
+        try:
+            data = json.loads(str(raw))
+        except Exception:
+            return []
+        if not isinstance(data, list):
+            return []
+        out: List[Tuple[str, str]] = []
+        for item in data:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                out.append((str(item[0]), str(item[1])))
+        return out
+
+    def _merge_model_entries_with_cache(
+        self,
+        fresh: List[Tuple[str, str]],
+        notes: List[str],
+    ) -> List[Tuple[str, str]]:
+        """
+        若本次 DeepSeek/Kimi 的 list-models 请求失败，沿用设置里上次成功的条目，
+        避免下拉框被 Ollama 等新数据源「全覆盖」后云端模型消失。
+        """
+        note_blob = "\n".join(str(n) for n in notes)
+        skip_ds = "未设置 DS_KEY" in note_blob
+        skip_kimi = "未设置 KIMI_KEY" in note_blob
+        fail_ds = "DeepSeek list-models:" in note_blob
+        fail_kimi = "Kimi list-models:" in note_blob
+
+        def has_prov(entries: List[Tuple[str, str]], p: str) -> bool:
+            return any(x[0] == p for x in entries)
+
+        merged = list(fresh)
+        seen = set(merged)
+        cached = self._cached_model_entries()
+
+        if fail_ds and not skip_ds and not has_prov(fresh, PROVIDER_DEEPSEEK):
+            for t in cached:
+                if t[0] == PROVIDER_DEEPSEEK and t not in seen:
+                    merged.append(t)
+                    seen.add(t)
+        if fail_kimi and not skip_kimi and not has_prov(fresh, PROVIDER_KIMI):
+            for t in cached:
+                if t[0] == PROVIDER_KIMI and t not in seen:
+                    merged.append(t)
+                    seen.add(t)
+
+        merged.sort(key=lambda x: (x[0], x[1]))
+        return merged
+
+    def _on_models_refresh_done(self, entries: list, notes: list) -> None:
+        fresh_pairs: List[Tuple[str, str]] = []
+        for item in entries or []:
+            if isinstance(item, (tuple, list)) and len(item) >= 2:
+                fresh_pairs.append((str(item[0]), str(item[1])))
+        merged = self._merge_model_entries_with_cache(fresh_pairs, list(notes))
+        if not merged:
+            msg = "未获取到任何模型。"
+            if notes:
+                msg += "\n\n" + "\n".join(str(n) for n in notes)
+            QMessageBox.warning(self, "刷新模型", msg)
+            self.statusBar().showMessage("刷新模型：列表为空", 6000)
+            return
+        self._apply_model_entries(merged, persist=True)
+        self._restore_last_model_choice()
+        self.update_next_context_preview()
+        self.render_chat()
+        note_txt = ""
+        if notes:
+            note_txt = " · " + "; ".join(str(n) for n in notes[:4])
+            if len(notes) > 4:
+                note_txt += "…"
+        self.statusBar().showMessage(f"已加载 {len(merged)} 个模型{note_txt}", 10000)
+
+    def _on_models_refresh_failed(self, message: str) -> None:
+        QMessageBox.warning(self, "刷新模型", message)
+        self.statusBar().showMessage("刷新模型失败", 6000)
+
+    def _on_models_refresh_finished(self) -> None:
+        self.refresh_models_btn.setEnabled(True)
+
+    def _assistant_display_name(self) -> str:
+        if not self._model_choice_ready():
+            return "Assistant"
+        p = self.current_provider()
+        if p == PROVIDER_KIMI:
+            return "Kimi"
+        if p == PROVIDER_OLLAMA:
+            return "Ollama"
+        return "DeepSeek"
+
+    def _ollama_ui_base_for_api(self) -> Optional[str]:
+        t = self.ollama_base_edit.text().strip()
+        return t if t else None
 
     def skill_scan_dirs(self):
         roots = []
@@ -1032,6 +1335,9 @@ class MainWindow(QMainWindow):
         self.sessions: List[SessionState] = []
         self._active_session_index: int = -1
         self.new_session()
+        # 个别环境下首个 Tab 可能不会触发 currentChanged，兜底对齐活动会话索引
+        if self._active_session_index < 0:
+            self._active_session_index = self.session_tabs.currentIndex()
 
     def new_session(self) -> None:
         idx = len(self.sessions) + 1
@@ -1154,18 +1460,31 @@ class MainWindow(QMainWindow):
     def on_generate_commit_message(self) -> None:
         if self.commit_worker and self.commit_worker.isRunning():
             return
-        try:
-            api_key = get_api_key()
-        except ValueError as exc:
-            QMessageBox.critical(self, "DS_KEY missing", str(exc))
+        if not self._model_choice_ready():
+            QMessageBox.warning(self, "模型", "请先点击「刷新模型」并选择具体模型。")
             return
-        model_mode = self.model_combo.currentData()
+        try:
+            api_key, api_url = resolve_chat_endpoint(
+                self.current_provider(),
+                ollama_ui_base=self._ollama_ui_base_for_api(),
+            )
+        except ValueError as exc:
+            QMessageBox.critical(self, "API Key", str(exc))
+            return
+        model_mode = self.current_model_mode()
         ws = self.workspace_path()
         proxy = self.model_proxy_addr.text().strip() if self.model_proxy_checkbox.isChecked() else None
         self.commit_log.setPlainText("[commit] 生成中…")
         self.commit_gen_btn.setEnabled(False)
         self.commit_do_btn.setEnabled(False)
-        self.commit_worker = CommitWorker(api_key=api_key, model_mode=model_mode, workspace=ws, proxy_url=proxy)
+        self.commit_worker = CommitWorker(
+            api_key=api_key,
+            model_mode=model_mode,
+            workspace=ws,
+            proxy_url=proxy,
+            api_url=api_url,
+            provider=self.current_provider(),
+        )
         self.commit_worker.done.connect(self.on_commit_done)
         self.commit_worker.failed.connect(self.on_commit_failed)
         self.commit_worker.finished.connect(self._on_commit_worker_finished)
@@ -1237,12 +1556,21 @@ class MainWindow(QMainWindow):
         """下一次 POST 与 deepseek_api / harness 对齐的摘要（便于调 prompt）。"""
         next_user = self.input_box.toPlainText().strip()
         msgs = self._build_next_request_messages(next_user)
-        mode = self.model_combo.currentData()
-        mode_str = str(mode or "flash").strip() or "flash"
+        prov = self.current_provider()
+        mode_str = self.current_model_mode() if self._model_choice_ready() else ""
+        resolved = resolve_model(mode_str, prov) if mode_str else ""
+        req_temp = 0.7
+        eff_temp = (
+            effective_temperature_for_resolved_model(resolved, req_temp, provider=prov)
+            if resolved
+            else req_temp
+        )
         payload: Dict[str, Any] = {
-            "model": resolve_model(mode_str),
+            "provider": prov,
+            "model": resolved,
             "model_mode": mode_str,
-            "temperature": 0.7,
+            "temperature": eff_temp,
+            "temperature_requested": req_temp,
             "stream": self.stream_checkbox.isChecked(),
             "messages": msgs,
         }
@@ -1264,7 +1592,14 @@ class MainWindow(QMainWindow):
             return full
         out: Dict[str, Any] = {}
         if show_meta:
-            for k in ("model", "model_mode", "temperature", "stream"):
+            for k in (
+                "provider",
+                "model",
+                "model_mode",
+                "temperature",
+                "temperature_requested",
+                "stream",
+            ):
                 if k in full:
                     out[k] = full[k]
         if show_msgs:
@@ -1312,13 +1647,20 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Input required", "Please enter a message.")
             return
 
-        try:
-            api_key = get_api_key()
-        except ValueError as exc:
-            QMessageBox.critical(self, "DS_KEY missing", str(exc))
+        if not self._model_choice_ready():
+            QMessageBox.warning(self, "模型", "请先点击「刷新模型」并选择具体模型。")
             return
 
-        model_mode = self.model_combo.currentData()
+        try:
+            api_key, api_url = resolve_chat_endpoint(
+                self.current_provider(),
+                ollama_ui_base=self._ollama_ui_base_for_api(),
+            )
+        except ValueError as exc:
+            QMessageBox.critical(self, "API Key", str(exc))
+            return
+
+        model_mode = self.current_model_mode()
         use_tools = self.tools_checkbox.isChecked()
         stream = self.stream_checkbox.isChecked()
 
@@ -1365,6 +1707,8 @@ class MainWindow(QMainWindow):
             allow_run_command=use_tools and self.allow_commands_checkbox.isChecked(),
             enable_web_search=use_tools and self.web_search_checkbox.isChecked(),
             proxy_url=self.model_proxy_addr.text().strip() if self.model_proxy_checkbox.isChecked() else None,
+            api_url=api_url,
+            provider=self.current_provider(),
         )
         self.worker.chunk.connect(self.on_chunk)
         self.worker.done.connect(self.on_done)
@@ -1475,7 +1819,7 @@ class MainWindow(QMainWindow):
             bubble_bg = "#d8f0ff"
             text_color = "#1f2937"
         else:
-            label = "DeepSeek"
+            label = self._assistant_display_name()
             row_align = "left"
             bubble_bg = "#ffffff"
             text_color = "#111827"
@@ -1688,10 +2032,17 @@ class MainWindow(QMainWindow):
         transcript = _flatten_messages_for_transcript(msgs)
         transcript_for_api = transcript[:SMART_SAVE_TRANSCRIPT_MAX_CHARS]
 
+        if not self._model_choice_ready():
+            QMessageBox.warning(self, "模型", "请先点击「刷新模型」并选择具体模型。")
+            return
+
         try:
-            api_key = get_api_key()
+            api_key, api_url = resolve_chat_endpoint(
+                self.current_provider(),
+                ollama_ui_base=self._ollama_ui_base_for_api(),
+            )
         except ValueError as exc:
-            QMessageBox.critical(self, "DS_KEY missing", str(exc))
+            QMessageBox.critical(self, "API Key", str(exc))
             return
 
         self._smart_save_pending = {"messages": msgs}
@@ -1699,9 +2050,11 @@ class MainWindow(QMainWindow):
         self.smart_save_button.setEnabled(False)
         self.smart_save_worker = SmartFilenameWorker(
             api_key=api_key,
-            model_mode=str(self.model_combo.currentData() or "flash"),
+            model_mode=self.current_model_mode(),
             transcript=transcript_for_api,
             proxy_url=proxy,
+            api_url=api_url,
+            provider=self.current_provider(),
         )
         self.smart_save_worker.done.connect(self._on_smart_save_filename_ok)
         self.smart_save_worker.failed.connect(self._on_smart_save_fail)
