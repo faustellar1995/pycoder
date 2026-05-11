@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt5.QtCore import QThread, Qt, pyqtSignal, QSettings
+from PyQt5.QtCore import QTimer
 from PyQt5.QtGui import QTextCursor
 from PyQt5.QtWidgets import (
     QApplication,
@@ -580,6 +581,7 @@ class MainWindow(QMainWindow):
         self.current_system_prompt = "You are a helpful assistant."
         self.pending_stream_text = ""
         self.awaiting_response = False
+        self._render_scheduled = False
         self.logs_dir = Path("./logs")
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.settings = QSettings("DeepSeekAssistant", "PyQtClient")
@@ -965,6 +967,21 @@ class MainWindow(QMainWindow):
         QShortcut("Ctrl+W", self, activated=lambda: self.close_session(self.session_tabs.currentIndex()))
         QShortcut("Ctrl+Tab", self, activated=lambda: self._cycle_session(1))
         QShortcut("Ctrl+Shift+Tab", self, activated=lambda: self._cycle_session(-1))
+
+    def _schedule_render_chat(self, delay_ms: int = 60) -> None:
+        """
+        流式输出时避免每个 token 都触发 setHtml 全量重绘（UI 会明显卡顿/假死）。
+        这里把渲染节流到固定帧率附近（默认 ~16FPS）。
+        """
+        if self._render_scheduled:
+            return
+        self._render_scheduled = True
+
+        def _do() -> None:
+            self._render_scheduled = False
+            self.render_chat()
+
+        QTimer.singleShot(max(0, int(delay_ms)), _do)
 
     def workspace_path(self) -> Path:
         text = self.workspace_edit.text().strip()
@@ -1719,7 +1736,7 @@ class MainWindow(QMainWindow):
 
     def on_chunk(self, text: str):
         self.pending_stream_text += text
-        self.render_chat()
+        self._schedule_render_chat()
 
     def on_interrupted(self):
         """Stop：保留已流式产出或本轮已返回的正文，写入 messages，供后续轮次使用。"""

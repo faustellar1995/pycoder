@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
@@ -370,6 +371,27 @@ def _post_json_with_proxy(
     return opener.open(request, timeout=timeout)
 
 
+def _try_set_response_socket_timeout(response: Any, seconds: float) -> None:
+    """
+    尝试把 urllib 的底层 socket 读超时设置得更短，以便：
+    - should_stop 能更快生效（不必等服务端吐一行 data 才能中断）
+    - 服务端长时间无输出时不会无限阻塞在 readline()
+    """
+    try:
+        fp = getattr(response, "fp", None)
+        if fp is None:
+            return
+        raw = getattr(fp, "raw", None)
+        if raw is None:
+            return
+        sock = getattr(raw, "_sock", None)
+        if sock is None:
+            return
+        sock.settimeout(seconds)
+    except Exception:
+        return
+
+
 def chat_completion(
     api_key: str,
     messages: List[Dict[str, str]],
@@ -438,8 +460,14 @@ def chat_completion_stream(
     with _post_json_with_proxy(
         payload, api_key, timeout, proxy_url=proxy_url, api_url=api_url
     ) as response:
+        _try_set_response_socket_timeout(response, seconds=1.0)
         while True:
-            raw_line = response.readline()
+            try:
+                raw_line = response.readline()
+            except socket.timeout:
+                if should_stop and should_stop():
+                    raise StreamInterrupted("Stream interrupted by user")
+                continue
             if not raw_line:
                 break
             if should_stop and should_stop():
@@ -600,8 +628,14 @@ def chat_completion_message_stream(
     with _post_json_with_proxy(
         payload, api_key, timeout, proxy_url=proxy_url, api_url=api_url
     ) as response:
+        _try_set_response_socket_timeout(response, seconds=1.0)
         while True:
-            raw_line = response.readline()
+            try:
+                raw_line = response.readline()
+            except socket.timeout:
+                if should_stop and should_stop():
+                    raise StreamInterrupted("Stream interrupted by user")
+                continue
             if not raw_line:
                 break
             if should_stop and should_stop():
