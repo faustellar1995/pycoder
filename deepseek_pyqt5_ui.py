@@ -28,6 +28,8 @@ from PyQt5.QtWidgets import (
     QSplitter,
     QTabWidget,
     QShortcut,
+    QSpinBox,
+    QDoubleSpinBox,
     QVBoxLayout,
     QWidget,
     QListWidget,
@@ -39,8 +41,11 @@ from deepseek_api import (
     PROVIDER_DEEPSEEK,
     PROVIDER_KIMI,
     PROVIDER_OLLAMA,
+    STREAM_TIMEOUT_DEFAULT,
+    STREAM_TIMEOUT_UNLIMITED,
     chat_completion,
     check_available,
+    effective_stream_timeout,
     effective_temperature_for_resolved_model,
     explain_http_error,
     resolve_chat_endpoint,
@@ -94,6 +99,8 @@ class AskWorker(QThread):
         proxy_url: Optional[str] = None,
         api_url: str = API_URL,
         provider: str = PROVIDER_DEEPSEEK,
+        temperature: float = 0.7,
+        timeout: int = STREAM_TIMEOUT_DEFAULT,
     ):
         super().__init__()
         self.api_key = api_key
@@ -108,6 +115,8 @@ class AskWorker(QThread):
         self.proxy_url = proxy_url
         self.api_url = api_url
         self.provider = provider
+        self.temperature = temperature
+        self.timeout = timeout
         self._should_stop = False
 
     def stop(self):
@@ -134,6 +143,8 @@ class AskWorker(QThread):
                 messages=self.messages,
                 model_mode=self.model_mode,
                 config=cfg,
+                temperature=self.temperature,
+                timeout=self.timeout,
                 should_stop=self.should_stop,
                 on_stream_token=self.chunk.emit if self.stream else None,
             )
@@ -665,7 +676,9 @@ class MainWindow(QMainWindow):
             pm = pm.lower() in ("1", "true", "yes")
         self.preview_show_meta_checkbox = QCheckBox("请求参数")
         self.preview_show_meta_checkbox.setChecked(bool(pm))
-        self.preview_show_meta_checkbox.setToolTip("model、model_mode、temperature、stream")
+        self.preview_show_meta_checkbox.setToolTip(
+            "model、model_mode、temperature、timeout、stream"
+        )
         self.preview_show_meta_checkbox.toggled.connect(
             lambda v: self.settings.setValue("preview_show_meta", bool(v))
         )
@@ -766,6 +779,46 @@ class MainWindow(QMainWindow):
         row_flags.addStretch(1)
         model_layout.addLayout(row_flags)
         model_layout.addWidget(self.model_proxy_addr)
+
+        row_params = QHBoxLayout()
+        row_params.addWidget(QLabel("Temperature"))
+        self.temperature_spin = QDoubleSpinBox()
+        self.temperature_spin.setRange(0.0, 2.0)
+        self.temperature_spin.setSingleStep(0.1)
+        self.temperature_spin.setDecimals(2)
+        temp_saved = self.settings.value("request_temperature", 0.7)
+        try:
+            temp_f = float(temp_saved)
+        except (TypeError, ValueError):
+            temp_f = 0.7
+        self.temperature_spin.setValue(max(0.0, min(2.0, temp_f)))
+        self.temperature_spin.setToolTip(
+            "采样温度。部分 Kimi K2.5/K2.6 模型 API 仅允许 temperature=1，预览区会显示实际生效值。"
+        )
+        row_params.addWidget(self.temperature_spin)
+        row_params.addWidget(QLabel("Timeout (s)"))
+        self.request_timeout_spin = QSpinBox()
+        self.request_timeout_spin.setRange(STREAM_TIMEOUT_UNLIMITED, 7200)
+        self.request_timeout_spin.setSingleStep(30)
+        self.request_timeout_spin.setSpecialValueText("∞")
+        timeout_saved = self.settings.value("request_timeout", STREAM_TIMEOUT_DEFAULT)
+        try:
+            timeout_i = int(timeout_saved)
+        except (TypeError, ValueError):
+            timeout_i = STREAM_TIMEOUT_DEFAULT
+        if timeout_i < 0:
+            timeout_i = STREAM_TIMEOUT_UNLIMITED
+        else:
+            timeout_i = max(30, min(7200, timeout_i))
+        self.request_timeout_spin.setValue(timeout_i)
+        self.request_timeout_spin.setToolTip(
+            "单次请求总超时（秒）。-1（∞）表示无限等待。"
+            "正值时本地 Ollama 思考模型会自动不低于 API 下限（当前 3600s）；"
+            "流式读轮询仍约 1s 以便 Stop 及时生效。"
+        )
+        row_params.addWidget(self.request_timeout_spin)
+        row_params.addStretch(1)
+        model_layout.addLayout(row_params)
 
         row_ollama = QHBoxLayout()
         row_ollama.addWidget(QLabel("Ollama 地址"))
@@ -937,6 +990,8 @@ class MainWindow(QMainWindow):
         self.model_combo.currentIndexChanged.connect(self.render_chat)
         self.refresh_models_btn.clicked.connect(self.on_refresh_models)
         self.stream_checkbox.toggled.connect(self.update_next_context_preview)
+        self.temperature_spin.valueChanged.connect(self._on_request_params_changed)
+        self.request_timeout_spin.valueChanged.connect(self._on_request_params_changed)
         self.allow_commands_checkbox.toggled.connect(self.update_next_context_preview)
         self.web_search_checkbox.toggled.connect(self.update_next_context_preview)
         self.auto_skill_checkbox.toggled.connect(self.update_next_context_preview)
@@ -1194,6 +1249,25 @@ class MainWindow(QMainWindow):
     def _ollama_ui_base_for_api(self) -> Optional[str]:
         t = self.ollama_base_edit.text().strip()
         return t if t else None
+
+    def _ui_temperature(self) -> float:
+        return float(self.temperature_spin.value())
+
+    def _ui_request_timeout(self) -> int:
+        return int(self.request_timeout_spin.value())
+
+    def _effective_request_timeout(self) -> Optional[int]:
+        prov = self.current_provider() if self._model_choice_ready() else PROVIDER_DEEPSEEK
+        return effective_stream_timeout(self._ui_request_timeout(), provider=prov)
+
+    @staticmethod
+    def _timeout_for_preview(value: Optional[int]) -> Any:
+        return "unlimited" if value is None else value
+
+    def _on_request_params_changed(self, *_args: Any) -> None:
+        self.settings.setValue("request_temperature", self._ui_temperature())
+        self.settings.setValue("request_timeout", self._ui_request_timeout())
+        self.update_next_context_preview()
 
     def skill_scan_dirs(self):
         roots = []
@@ -1576,18 +1650,24 @@ class MainWindow(QMainWindow):
         prov = self.current_provider()
         mode_str = self.current_model_mode() if self._model_choice_ready() else ""
         resolved = resolve_model(mode_str, prov) if mode_str else ""
-        req_temp = 0.7
+        req_temp = self._ui_temperature()
         eff_temp = (
             effective_temperature_for_resolved_model(resolved, req_temp, provider=prov)
             if resolved
             else req_temp
         )
+        req_timeout = self._ui_request_timeout()
+        eff_timeout = self._effective_request_timeout()
         payload: Dict[str, Any] = {
             "provider": prov,
             "model": resolved,
             "model_mode": mode_str,
             "temperature": eff_temp,
             "temperature_requested": req_temp,
+            "timeout": self._timeout_for_preview(eff_timeout),
+            "timeout_requested": self._timeout_for_preview(
+                None if req_timeout < 0 else req_timeout
+            ),
             "stream": self.stream_checkbox.isChecked(),
             "messages": msgs,
         }
@@ -1615,6 +1695,8 @@ class MainWindow(QMainWindow):
                 "model_mode",
                 "temperature",
                 "temperature_requested",
+                "timeout",
+                "timeout_requested",
                 "stream",
             ):
                 if k in full:
@@ -1726,6 +1808,8 @@ class MainWindow(QMainWindow):
             proxy_url=self.model_proxy_addr.text().strip() if self.model_proxy_checkbox.isChecked() else None,
             api_url=api_url,
             provider=self.current_provider(),
+            temperature=self._ui_temperature(),
+            timeout=self._ui_request_timeout(),
         )
         self.worker.chunk.connect(self.on_chunk)
         self.worker.done.connect(self.on_done)

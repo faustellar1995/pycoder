@@ -1,9 +1,17 @@
+import errno
 import json
 import os
+import select
 import socket
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+
+# 流式 SSE：短轮询便于 Stop；总等待时长由 opener.open(timeout=…) 控制，思考模型需足够大
+STREAM_READ_POLL_SEC = 1.0
+STREAM_TIMEOUT_DEFAULT = 180
+STREAM_TIMEOUT_OLLAMA = 3600
+STREAM_TIMEOUT_UNLIMITED = -1
 
 API_URL = "https://api.deepseek.com/chat/completions"
 MODEL_ALIASES: Dict[str, str] = {
@@ -356,7 +364,7 @@ def _request_headers(api_key: str) -> Dict[str, str]:
 def _post_json_with_proxy(
     payload: Dict[str, object],
     api_key: str,
-    timeout: int,
+    timeout: Optional[int],
     *,
     proxy_url: Optional[str],
     api_url: str = API_URL,
@@ -371,53 +379,129 @@ def _post_json_with_proxy(
     return opener.open(request, timeout=timeout)
 
 
-def _try_set_response_socket_timeout(response: Any, seconds: float) -> None:
-    """
-    尝试把 urllib 的底层 socket 读超时设置得更短，以便：
-    - should_stop 能更快生效（不必等服务端吐一行 data 才能中断）
-    - 服务端长时间无输出时不会无限阻塞在 readline()
-    """
-    try:
-        fp = getattr(response, "fp", None)
-        if fp is None:
-            return
-        raw = getattr(fp, "raw", None)
-        if raw is None:
-            return
-        sock = getattr(raw, "_sock", None)
-        if sock is None:
-            return
-        sock.settimeout(seconds)
-    except Exception:
-        return
-
-
-def chat_completion(
-    api_key: str,
-    messages: List[Dict[str, str]],
-    model_mode: str = "flash",
-    temperature: float = 0.7,
-    timeout: int = 60,
-    proxy_url: Optional[str] = None,
+def effective_stream_timeout(
+    timeout: Optional[int],
     *,
-    api_url: str = API_URL,
     provider: str = PROVIDER_DEEPSEEK,
-) -> str:
-    payload = _build_payload(messages, model_mode, temperature, stream=False, provider=provider)
-    with _post_json_with_proxy(
-        payload, api_key, timeout, proxy_url=proxy_url, api_url=api_url
-    ) as response:
-        data = json.loads(response.read().decode("utf-8"))
+) -> Optional[int]:
+    """
+    解析请求总超时（秒），供 urllib opener.open 使用。
+    ``STREAM_TIMEOUT_UNLIMITED``（-1）或任意负值 → ``None``（无限等待）。
+    本地 Ollama 思考阶段可能数分钟无首包，正值下限显著长于云端 API。
+    """
+    if timeout is not None and timeout < 0:
+        return None
+    base = timeout if timeout is not None and timeout > 0 else STREAM_TIMEOUT_DEFAULT
+    p = (provider or PROVIDER_DEEPSEEK).strip().lower()
+    if p == PROVIDER_OLLAMA:
+        return max(base, STREAM_TIMEOUT_OLLAMA)
+    return base
 
-    choices = data.get("choices", [])
-    if not choices:
-        raise ValueError(f"Unexpected API response: {data}")
 
-    message = choices[0].get("message", {})
-    content = message.get("content")
-    if not content:
-        raise ValueError(f"Empty response content: {data}")
-    return content.strip()
+def _get_response_socket(response: Any) -> Optional[socket.socket]:
+    """从 urllib HTTPResponse 解析底层 socket（Windows / 各 Python 版本结构略有差异）。"""
+    seen: set[int] = set()
+    obj: Any = response
+    for _ in range(10):
+        if obj is None or id(obj) in seen:
+            break
+        seen.add(id(obj))
+        if isinstance(obj, socket.socket):
+            return obj
+        nxt = getattr(obj, "fp", None) or getattr(obj, "_fp", None)
+        if nxt is not None and nxt is not obj:
+            obj = nxt
+            continue
+        raw = getattr(obj, "raw", None)
+        if raw is not None and raw is not obj:
+            obj = raw
+            continue
+        sock = getattr(obj, "_sock", None)
+        if sock is not None and sock is not obj:
+            obj = sock
+            continue
+        break
+    return obj if isinstance(obj, socket.socket) else None
+
+
+def _clear_socketio_timeout_flag(response: Any) -> None:
+    """
+    urllib 经 SocketIO 读超时后会置 ``_timeout_occurred``，此后读会直接
+    ``OSError: cannot read from timed out object``。SSE 轮询需在每次可恢复
+    的超时后清除该标记。
+    """
+    fp = getattr(response, "fp", None) or getattr(response, "_fp", None)
+    if fp is None:
+        return
+    for obj in (fp, getattr(fp, "raw", None)):
+        if obj is not None and hasattr(obj, "_timeout_occurred"):
+            try:
+                obj._timeout_occurred = False
+            except Exception:
+                pass
+
+
+def _is_read_timeout_error(exc: BaseException) -> bool:
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return True
+    if isinstance(exc, OSError):
+        msg = str(exc).lower()
+        if "timed out object" in msg:
+            return True
+        if exc.errno in (errno.ETIMEDOUT, errno.EWOULDBLOCK):
+            return True
+        # Windows WSAETIMEDOUT
+        if getattr(exc, "winerror", None) == 10060:
+            return True
+    return False
+
+
+def _iter_sse_stream_lines(
+    response: Any,
+    *,
+    should_stop: Optional[Callable[[], bool]] = None,
+    read_poll_sec: float = STREAM_READ_POLL_SEC,
+) -> Iterator[bytes]:
+    """
+    逐行读取 SSE。
+
+    用 ``select`` 做短轮询（便于 Stop），避免对同一 SocketIO 反复 ``readline``
+    触发「cannot read from timed out object」（见 socket.SocketIO._timeout_occurred）。
+    """
+    sock = _get_response_socket(response)
+    _clear_socketio_timeout_flag(response)
+    if sock is not None:
+        try:
+            sock.settimeout(None)
+        except OSError:
+            pass
+
+    while True:
+        if should_stop and should_stop():
+            raise StreamInterrupted("Stream interrupted by user")
+
+        if sock is not None:
+            try:
+                readable, _, _ = select.select([sock], [], [], read_poll_sec)
+            except (ValueError, OSError):
+                break
+            if not readable:
+                continue
+
+        try:
+            raw_line = response.readline()
+        except BaseException as exc:
+            if _is_read_timeout_error(exc):
+                _clear_socketio_timeout_flag(response)
+                if should_stop and should_stop():
+                    raise StreamInterrupted("Stream interrupted by user")
+                continue
+            raise
+        if not raw_line:
+            break
+        if should_stop and should_stop():
+            raise StreamInterrupted("Stream interrupted by user")
+        yield raw_line
 
 
 def _normalize_delta_piece(val: Any) -> str:
@@ -439,6 +523,47 @@ def _normalize_delta_piece(val: Any) -> str:
     return str(val)
 
 
+def _extract_reasoning_from_delta(delta: Dict[str, Any]) -> str:
+    """思考链字段：DeepSeek reasoning_content、Ollama/OpenAI reasoning、原生 thinking。"""
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        piece = delta.get(key)
+        if piece is None:
+            continue
+        s = _normalize_delta_piece(piece)
+        if s:
+            return s
+    return ""
+
+
+def chat_completion(
+    api_key: str,
+    messages: List[Dict[str, str]],
+    model_mode: str = "flash",
+    temperature: float = 0.7,
+    timeout: int = 60,
+    proxy_url: Optional[str] = None,
+    *,
+    api_url: str = API_URL,
+    provider: str = PROVIDER_DEEPSEEK,
+) -> str:
+    payload = _build_payload(messages, model_mode, temperature, stream=False, provider=provider)
+    req_timeout = effective_stream_timeout(timeout, provider=provider)
+    with _post_json_with_proxy(
+        payload, api_key, req_timeout, proxy_url=proxy_url, api_url=api_url
+    ) as response:
+        data = json.loads(response.read().decode("utf-8"))
+
+    choices = data.get("choices", [])
+    if not choices:
+        raise ValueError(f"Unexpected API response: {data}")
+
+    message = choices[0].get("message", {})
+    content = message.get("content")
+    if not content:
+        raise ValueError(f"Empty response content: {data}")
+    return content.strip()
+
+
 def chat_completion_stream(
     api_key: str,
     messages: List[Dict[str, str]],
@@ -453,26 +578,16 @@ def chat_completion_stream(
 ) -> Iterator[str]:
     """流式输出；消费 delta 内 reasoning / content 等字段。
 
-    思考模式往往先出 reasoning_content（或 reasoning），再出 content；只读其一可能长时间无输出。
+    思考模式往往先出 reasoning_content（或 reasoning / thinking），再出 content。
+    读超时仅用于轮询 Stop；总等待由 effective_stream_timeout 控制（Ollama 默认更长）。
     请求使用 Accept-Encoding: identity，避免 gzip + urllib 把整段 SSE 缓冲后才解压（界面表现为非流式）。
     """
     payload = _build_payload(messages, model_mode, temperature, stream=True, provider=provider)
+    req_timeout = effective_stream_timeout(timeout, provider=provider)
     with _post_json_with_proxy(
-        payload, api_key, timeout, proxy_url=proxy_url, api_url=api_url
+        payload, api_key, req_timeout, proxy_url=proxy_url, api_url=api_url
     ) as response:
-        _try_set_response_socket_timeout(response, seconds=1.0)
-        while True:
-            try:
-                raw_line = response.readline()
-            except socket.timeout:
-                if should_stop and should_stop():
-                    raise StreamInterrupted("Stream interrupted by user")
-                continue
-            if not raw_line:
-                break
-            if should_stop and should_stop():
-                raise StreamInterrupted("Stream interrupted by user")
-
+        for raw_line in _iter_sse_stream_lines(response, should_stop=should_stop):
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line or line.startswith(":"):
                 continue
@@ -493,11 +608,7 @@ def chat_completion_stream(
                 continue
 
             delta = choices[0].get("delta") or {}
-            # 思考链（字段名以服务端为准）
-            r_piece = delta.get("reasoning_content")
-            if r_piece is None:
-                r_piece = delta.get("reasoning")
-            r = _normalize_delta_piece(r_piece)
+            r = _extract_reasoning_from_delta(delta)
             if r:
                 yield r
             c = _normalize_delta_piece(delta.get("content"))
@@ -540,7 +651,7 @@ def _post_json_return_dict(
 def _post_json_return_dict_with_proxy(
     payload: Dict[str, Any],
     api_key: str,
-    timeout: int,
+    timeout: Optional[int],
     *,
     proxy_url: Optional[str],
     api_url: str = API_URL,
@@ -597,8 +708,9 @@ def chat_completion_message(
     payload = _build_tool_payload(
         messages, model_mode, temperature, False, tools, tool_choice, provider=provider
     )
+    req_timeout = effective_stream_timeout(timeout, provider=provider)
     return _post_json_return_dict_with_proxy(
-        payload, api_key, timeout, proxy_url=proxy_url, api_url=api_url
+        payload, api_key, req_timeout, proxy_url=proxy_url, api_url=api_url
     )
 
 
@@ -625,22 +737,11 @@ def chat_completion_message_stream(
     content_parts: List[str] = []
     tool_calls_acc: Dict[int, Dict[str, Any]] = {}
 
+    req_timeout = effective_stream_timeout(timeout, provider=provider)
     with _post_json_with_proxy(
-        payload, api_key, timeout, proxy_url=proxy_url, api_url=api_url
+        payload, api_key, req_timeout, proxy_url=proxy_url, api_url=api_url
     ) as response:
-        _try_set_response_socket_timeout(response, seconds=1.0)
-        while True:
-            try:
-                raw_line = response.readline()
-            except socket.timeout:
-                if should_stop and should_stop():
-                    raise StreamInterrupted("Stream interrupted by user")
-                continue
-            if not raw_line:
-                break
-            if should_stop and should_stop():
-                raise StreamInterrupted("Stream interrupted by user")
-
+        for raw_line in _iter_sse_stream_lines(response, should_stop=should_stop):
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line or line.startswith(":"):
                 continue
@@ -662,10 +763,7 @@ def chat_completion_message_stream(
 
             delta = choices[0].get("delta") or {}
 
-            r_piece = delta.get("reasoning_content")
-            if r_piece is None:
-                r_piece = delta.get("reasoning")
-            rs = _normalize_delta_piece(r_piece)
+            rs = _extract_reasoning_from_delta(delta)
             if rs:
                 reasoning_parts.append(rs)
                 if on_stream_token:
