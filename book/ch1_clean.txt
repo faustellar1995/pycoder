@@ -1,0 +1,839 @@
+i
+i
+i
+i
+i
+i
+i
+i
+SURFACE
+REPRESENTATIONS
+Geometry processing is mostly about applying algorithms to geometric
+models. If the algorithms represent the action, then the geometry is the
+object. In this section we are going to discuss various mathematical repre-
+sentations for geometric objects. While these representations can be 2D or
+3D, the actual geometry that we are dealing with will always be the 2D
+surface of a 3D solid object. As we will see throughout this book, for each
+specific problem in geometry processing, we can identify a characteristic
+set of operations by which the computation is dominated, and hence we
+have to choose an appropriate representation that supports the efficient
+implementation of these operations.
+From a high-level point of view, there are two major classes of surface
+representations: parametric representations and implicit representations.
+Parametric surfaces are defined by a vector-valued parameterization func-
+tion f : Ω → S that maps a 2D parameter domain Ω ⊂ I R2 to the surface
+S = f(Ω) ⊂ I R3. In contrast, an implicit (or volumetric) surface represen-
+tation is defined to be the zero set of a scalar-valued function F : I R3 → I R,
+i.e., S = {x ∈ I R3 | F (x) = 0}.
+For illustration, we can define curves analogously in a parametric fash-
+ion by functions f : Ω → C with Ω = [ a, b] ⊂ I R. A corresponding implicit
+definition is only available for planar curves, i.e., C = {x ∈ I R2 | F (x) = 0}
+with F : I R2 → I R. A simple 2D example is the unit circle, which can be
+1
+i
+i
+i
+i
+i
+i
+i
+i
+2 1. Surface Representations
+defined by the range of a parametric function
+f : [0, 2π] → I R2 , t ↦→
+(cos t
+sin t
+)
+,
+as well as by the kernel of the implicit function
+F : I R2 → I R, (x, y) ↦→
+√
+x2 + y2 − 1.
+Similarly, in 3D, a sphere can be represented by a parametric or an implicit
+equation (see Section 3.2 for more details).
+For more complex shapes, it is often not feasible to find an explicit
+formulation with a single function that approximates a given shape with
+sufficient accuracy. Hence, the function domain is usually split into smaller
+sub-regions and an individual function (surface patch) is defined for each
+segment. In this piecewise definition, each function needs to approximate
+the given shape only locally, while the global approximation tolerance is
+controlled by the size and number of the segments. The mathematical
+challenge is to guarantee a consistent transition from each patch to its
+neighboring ones. The most common piecewise surface definition in the
+parametric case is the segmentation of Ω into triangles or quadrangles.
+For implicit surface definitions, the embedding space is usually split into
+hexahedral (voxels) or tetrahedral cells.
+Both parametric and implicit representations have their particular
+strengths and weaknesses, such that for each geometric problem the better
+suited one should be chosen. In order to analyze geometric operations and
+their requirements on the surface representation, one can classify them into
+the following three categories [Kobbelt 03]:
+▶ Evaluation. This entails the sampling of the surface geometry or of
+other surface attributes, e.g., the surface normal field. A typical
+application example is surface rendering.
+▶ Query. Spatial queries are used to determine whether or not a given
+point p ∈ I R3 is inside or outside of the solid bounded by a surface
+S, which is a key component for solid modeling operations. Another
+typical query is the computation of a point’s distance to a surface.
+▶ Modification. A surface can be modified either in terms of geometry
+(surface deformation) or in terms of topology (e.g., when different
+parts of the surface are to be merged, cut, or deleted).
+We will see that parametric and implicit surface representations have
+complementary advantages with respect to these three types of geometric
+operations, i.e., the strengths in terms of efficiency or robustness of the one
+i
+i
+i
+i
+i
+i
+i
+i
+1.1. Surface Definition and Properties 3
+are often the drawbacks of the other. Hence, for each specific geometric
+problem, the more suitable representation should be chosen, which, in turn,
+requires efficient conversion routines between the two representations (see
+Section 1.5). In Section 1.6 we present an outlook to approaches that
+combine both representations in order to design algorithms that are both
+efficient and robust.
+1.1 Surface Definition and Properties
+The common definition of a surface in the context of computer graph-
+ics applications is “an orientable continuous 2D manifold embedded in
+I R3.” Intuitively, this can be understood as the boundary surface of a
+non-degenerate 3D solid where non-degenerate means that the solid does
+not have any infinitely thin parts or features such that the surface properly
+separates the “interior” and “exterior” of the solid (see Figure 1.1). A sur-
+face with boundaries is one that can be extended into a proper manifold
+surface by filling the holes.
+Figure 1.1. An orientable continuous 2-manifold describes the surface of a non-
+degenerate solid. A degenerate/non-manifold vertex (top left), which is fixed in
+(top right). A solid with a degenerate/non-manifold edge (bottom left), fixed in
+(bottom right).
+i
+i
+i
+i
+i
+i
+i
+i
+4 1. Surface Representations
+Figure 1.2. A manifold curve. While the points f(a), f(b), and f(c) are all
+in close spatial proximity, only f(a) and f(b) are geodesic neighbors since their
+pre-images a and b are neighbors, too. In red: The pre-image of a sufficiently
+small δ neighborhood around f(a) in I R2 lies in an ε neighborhood of a in I R.
+Since in most applications the raw information about the input surface
+is obtained by discrete sampling (i.e., by evaluation if there already exists
+a digital representation, or by probing if the input comes from a real ob-
+ject), the first step in generating a mathematical surface representation is
+to establish continuity. This requires building a consistent neighborhood
+relation between the samples. In this context, consistency refers to the
+existence of a manifold surface from which the samples are drawn.
+While this so-called geodesic neighborhood relation (in contrast to a
+spatial neighborhood relation) is difficult to access in implicit representa-
+tions, it is quite easy to extract from parametric representations in which
+two points on the surface are in geodesic proximity, if the corresponding
+pre-images in Ω are close to each other (see Figure 1.2). From this obser-
+vation we can derive an alternative characterization of local manifoldness:
+a continuous parametric surface is locally manifold at a surface point p if,
+for every other surface point q within a sufficiently small sphere of radius δ
+around p, the corresponding pre-image is contained in a circle of some ra-
+dius ε = O(δ) around the pre-image of p. A more intuitive way to express
+this condition is to say that the surface patch that lies within a sufficiently
+small δ-sphere around p is topologically equivalent (homeomorphic) to a
+disk. Since this second definition does not require a parameterization, it
+applies to implicit representations as well.
+When generating a continuous surface from a set of discrete samples, we
+can either require this surface to interpolate the samples or to approximate
+them subject to a certain prescribed tolerance. The latter case is considered
+more relevant in practical applications, since samples are usually affected by
+position noise and the surface in between the samples is an approximation
+i
+i
+i
+i
+i
+i
+i
+i
+1.2. Approximation Power 5
+Figure 1.3. Three examples of fair surfaces, which define a blend between two
+cylinders: a membrane surface that minimizes the surface area (left), a thin-plate
+surface that minimizes total curvature (center), and a surface that minimizes the
+variation of mean curvature (right). (Image taken from [Botsch and Kobbelt 04a].
+c⃝2004 ACM, Inc. Included here by permission.)
+anyway. In the next section we will consider the issue of approximation in
+more detail.
+Except for a well-defined set of sharp feature-curves and -corners, a sur-
+face should be smooth in general. Mathematically this is measured by the
+number k of continuous derivatives that the functions f or F have. Notice
+that this analytical definition of Ck smoothness coincides with the intuitive
+geometrical understanding of smoothness only if the partial derivatives of
+f or the gradient of F , respectively, do not vanish locally ( regularity).
+An even stricter requirement for surfaces is fairness, where not only
+the continuity of the derivatives but also their magnitude and variation is
+considered. There is no general formal definition for the aesthetic concept
+of fairness, but a surface is usually considered fair if, e.g., the curvature or
+its variation is globally minimized (see Figure 1.3).
+In Chapter 3 we will explain how the notion of curvature can be gener-
+alized to polygon meshes such that properties like smoothness and fairness
+can be applied to meshes as well (see Chapter 4).
+1.2 Approximation Power
+The exact mathematical modeling of a real object or its boundary is usu-
+ally intractable. Hence, a digital surface representation can only be an
+approximation in general. As mentioned in the introduction, in order to
+simplify the approximation tasks, the domain of the representation is of-
+ten split into small segments, and for each segment a function (a patch) is
+defined that locally approximates the part of the input that belongs to the
+segment.
+i
+i
+i
+i
+i
+i
+i
+i
+6 1. Surface Representations
+Since our surface representations are supposed to support efficient pro-
+cessing, a natural choice is to restrict functions to the class of polynomi-
+als because those can be evaluated by elementary arithmetic operations.
+Another justification for the restriction to polynomials is the well-known
+Weierstrass theorem that guarantees that each smooth function can be
+approximated by a polynomial up to any desired precision [Ross 80].
+From calculus we know that a C∞ function g with bounded derivatives
+can be approximated over an interval of length h by a polynomial of degree
+p such that the approximation error behaves like O(hp+1) (e.g., Taylor’s
+theorem or generalized mean value theorem) [Rudin 02]. As a consequence
+there are, in principle, two possibilities to improve the accuracy of an ap-
+proximation with piecewise polynomials. We can either raise the degree of
+the polynomial ( p-refinement) or we can reduce the size of the individual
+segments and use more segments for the approximation ( h-refinement).
+In geometry processing applications, h-refinement is usually preferred
+over p-refinement since, for a discretely sampled input surface, we can-
+not make reasonable assumptions about the boundedness of higher-order
+derivatives. Moreover, for piecewise polynomials with higher degree, the
+Ck smoothness conditions between segments are sometimes quite difficult
+to satisfy. Finally, with today’s computer architectures, processing a large
+number of very simple objects is often much more efficient than processing a
+smaller number of more complex ones. This is why the somewhat extremal
+choice of C0 piecewise linear surface representations, i.e., polygonal meshes,
+have become the widely established standard in geometry processing.
+While, for parametric surfaces, the O(hp+1) approximation error esti-
+mate follows from the mean value theorem in a straightforward manner,
+a more careful consideration is necessary for implicit representations. The
+generalized mean value theorem states that if a sufficiently smooth function
+g over an interval [ a, a + h] is interpolated at the abscissae t0, . . . , tp by a
+polynomial f of degree p, then the approximation error is bounded by
+|f(t) − g(t)| ≤ 1
+(p + 1)! max f(p+1)
+p∏
+i=0
+(ti − t) = O(hp+1).
+For an implicit representation G: I R3 → I R and the corresponding polyno-
+mial approximant F , this theorem is still valid; however, here the actual
+surface geometry is not defined by the function values G(x), for which this
+theorem gives an error estimate, but by the zero level set of G, i.e., by
+S = {x ∈ I R3 | G(x) = 0}.
+Consider a point x on the implicit surface defined by the approximating
+polynomial F , i.e., F (x) = 0 within some voxel. We can find a correspond-
+ing point x + d on the implicit surface defined by G, i.e., G(x + d) = 0
+by shooting a ray in normal direction to F , i.e., d = d ∇F/∥∇F ∥. For a
+i
+i
+i
+i
+i
+i
+i
+i
+1.3. Parametric Surface Representations 7
+sufficiently small voxel size h, we obtain
+|F (x + d)| ≈ | d| ∥∇F (x)∥ ⇒ | d| ≈ |F (x + d)|
+∥∇F (x)∥ ,
+and from the mean value theorem we get
+|F (x + d) − G(x + d)| = |F (x + d)| = O(hp+1),
+which yields |d| = O(hp+1) if the magnitude of the gradient ∥∇F ∥ is
+bounded from below by some ε > 0. In practice one tries to find an
+approximating polynomial F with low variation of the gradient magnitude
+in order to have a uniform distribution of the approximation error.
+1.3 Parametric Surface Representations
+Parametric surface representations have the advantage that the function
+f : Ω → S enables the reduction of many 3D problems on the surface S
+to 2D problems in the parameter domain Ω. For instance, sample points
+on the surface can easily be generated by sampling the domain Ω and
+evaluating the function f. In a similar manner, geodesic neighborhoods,
+i.e., neighborhoods on the surface S, can easily be found by considering
+neighboring points in the parameter domain Ω. A simple composition
+of f with a deformation function d : I R3 → I R3 results in an efficient
+modification of the surface geometry.
+On the other hand, generating a parametric surface parameterization f
+can be very complex, since the parameter domain Ω has to match the topo-
+logical and metric structure of the surface S (Chapter 5). When chang-
+ing the shape of S, it might be necessary to update the parameteriza-
+tion accordingly in order to reflect the respective changes of the under-
+lying geometry: a low-distortion parameterization requires the metrics in
+S and Ω to be similar, and hence we have to avoid or adapt to excessive
+stretching.
+Since the manifold surface S is defined as the range of the parameteriza-
+tion f, its topology is equivalent to that of Ω iff is continuous and injective.
+This implies that changing the topology of a parametric surface S can be
+extremely complicated because not only the parameterization but also the
+domain Ω has to be adjusted accordingly. The typical inside/outside or
+signed distance queries are, in general, also very expensive on paramet-
+ric surfaces since they usually require finding the closest point on S to the
+query point (foot point). The same applies to the detection of self-collisions
+(i.e., non-injectivities). Hence, topological modification and spatial queries
+are the weak points of parametric surfaces.
+i
+i
+i
+i
+i
+i
+i
+i
+8 1. Surface Representations
+1.3.1 Spline Surfaces
+Tensor-product spline surfaces—often called NURBS—are the standard
+surface representation in today’s CAD systems. They are used for con-
+structing high-quality surfaces (“class A”) as well as for freeform surface
+editing tasks. Spline surfaces can be described conveniently by piecewise
+polynomial or rational B-spline basis functions Nn
+i (·). For more detail, see
+e.g., [Farin 97,Piegl and Tiller 97,Prautzsch et al. 02].
+A tensor product spline surface f of bi-degree n is a piecewise polyno-
+mial surface that is built by connecting several polynomial patches in a
+smooth Cn−1 manner. The rectangular segments are defined by two knot
+vectors {u0, . . . , um+n} and {v0, . . . , vk+n} and the overall surface is then
+obtained by
+f : [un, um] × [vn, vk] → I R3 (1.1)
+(u, v) ↦→
+m∑
+i=0
+k∑
+j=0
+cijNn
+i (u)Nn
+j (v). (1.2)
+The control points cij ∈ I R3 define the so-called control mesh of the spline
+surface. Because Nn
+i (u) ≥ 0 and ∑
+i Nn
+i ≡ 1, each surface point f(u, v) is a
+convex combination of the control pointscij; i.e., the surface lies within the
+convex hull of the control mesh. Due to the minimal support of the basis
+functions, each control point has local influence only. These two properties
+cause spline surfaces to closely follow the control mesh, thereby providing
+a geometrically intuitive metaphor for modeling the shape of surfaces by
+adjusting their control points.
+A tensor-product surface—as the image of a rectangular domain under
+the parameterization f—always represents a rectangular surface patch em-
+bedded in I R3. If shapes of more complicated topological structure are to
+be represented by spline surfaces, the model has to be decomposed into a
+number of (possibly trimmed) tensor-product patches.
+As a consequence of these topological constraints, typical CAD models
+often consist of a huge collection of surface patches. In order to represent a
+high-quality, globally smooth surface, these patches have to be connected in
+a smooth manner, leading to additional geometric constraints that have to
+be taken care of throughout all surface processing phases. The large number
+of surface patches and the resulting topological and geometric constraints
+significantly complicate surface construction, and in particular the later
+surface modeling tasks.
+Another drawback of classical tensor-product spline representations is
+that adding more control vertices ( refinement) is only possible by split-
+ting parameter intervals [ ui, ui+1] or [ vj, vj+1], which affects an entire
+row or column of the control mesh, respectively. Here, the alternative
+i
+i
+i
+i
+i
+i
+i
+i
+1.3. Parametric Surface Representations 9
+representation by T-splines can improve the situation since they enable
+the local refinement of the control mesh [Sederberg et al. 03].
+1.3.2 Subdivision Surfaces
+Subdivision surfaces [Zorin et al. 00] can be considered a generalization
+of spline surfaces since they are also controlled by a coarse control mesh,
+but in contrast to spline surfaces, they can represent surfaces of arbitrary
+topology. Subdivision surfaces are generated by repeated refinement of
+control meshes: after each topological refinement step, the positions of the
+(old and new) vertices are adjusted based on a set of local averaging rules
+(see Figure 1.4). A careful analysis of these rules reveals that in the limit
+this process results in a surface of provable smoothness [Peters and Reif 08].
+As a consequence, subdivision surfaces are restricted neither by topo-
+logical (other than manifoldness) nor by geometric constraints as spline
+surfaces are, and their inherent hierarchical structure allows for highly
+efficient algorithms. However, subdivision techniques are limited to pro-
+ducing meshes with so-called semiregular subdivision connectivity, i.e., sur-
+face meshes whose triangulations are the result of repeated uniform refine-
+ment of a coarse control mesh. As this constraint is not met by arbitrary
+meshes, those would have to be remeshed to subdivision connectivity in a
+Figure 1.4. Subdivision surfaces are generated by iterative uniform refinement of
+a coarse control mesh. (Image taken from [Botsch 05].)
+i
+i
+i
+i
+i
+i
+i
+i
+10 1. Surface Representations
+preprocessing step [Eck et al. 95, Lee et al. 98, Kobbelt et al. 99a, Guskov
+et al. 00]. But, since this remeshing corresponds to a resampling of the sur-
+face, it usually leads to sampling artifacts and loss of information. In order
+to avoid the restrictions caused by these connectivity constraints, our goal
+is to work on arbitrary triangle meshes, as they provide higher flexibility
+and still allow for efficient surface processing.
+1.3.3 Triangle Meshes
+In many geometry processing algorithms, triangle meshes are considered a
+collection of triangles without any particular mathematical structure. In
+principle, however, each triangle defines, via its barycentric parameteriza-
+tion, a segment of a piecewise linear surface representation.
+Every point p in the interior of a triangle [ a, b, c] can be written in a
+unique fashion as a barycentric combination of the corner points:
+p = α a + β b + γ c, (1.3)
+with
+α + β + γ = 1, α, β, γ ≥ 0.
+By choosing an arbitrary triangle [ u, v, w] in the parameter domain, we
+can define a linear mapping f : I R2 → I R3 with
+α u + β v + γ w ↦→ α a + β b + γ c. (1.4)
+Based on this per-triangle mapping, it is sufficient to define a 2D posi-
+tion for each vertex in order to derive a global parameterization for an
+entire triangle mesh. In Chapter 5 we will discuss sophisticated meth-
+ods for choosing this triangulation in the parameter domain such that
+the distortion caused by the piecewise linear mapping from I R 2 to I R3 is
+minimized.
+A triangle mesh M consists of a geometric and a topological compo-
+nent, where the latter can be represented by a graph structure (simplicial
+complex) with a set of vertices
+V = {v1, . . . , vV }
+and a set of triangular faces connecting them
+F = {f1, . . . , fF } , f i ∈ V × V × V .
+However, as we will see in Chapter 2, it is sometimes more efficient to
+represent the connectivity of a triangle mesh in terms of the edges of the
+respective graph,
+E = {e1, . . . , eE} , e i ∈ V × V .
+i
+i
+i
+i
+i
+i
+i
+i
+1.3. Parametric Surface Representations 11
+The geometric embedding of a triangle mesh into I R 3 is specified by asso-
+ciating a 3D position pi to each vertex vi ∈ V :
+P = {p1, . . . ,pV } , pi := p(vi) =
+
+
+x(vi)
+y(vi)
+z(vi)
+
+ ∈ I R3,
+such that each face f ∈ F actually corresponds to a triangle in 3-space
+specified by its three vertex positions. Notice that even if the geometric
+embedding is defined by assigning 3D positions to the discrete vertices,
+the resulting polygonal surface is still a continuous surface consisting of
+triangular pieces with linear parameterization functions (Equation (1.4)).
+If a sufficiently smooth surface is approximated by such a piecewise
+linear function, the approximation error is of the order O(h2), with h de-
+noting the maximum edge length. Due to this quadratic approximation
+power, the error is reduced by a factor of about 1 /4 when halving the edge
+lengths. As this refinement splits each triangle into four sub-triangles, it
+increases the number of triangles from F to 4 F (see Figure 1.5). Hence,
+the approximation error of a triangle mesh is inversely proportional to its
+number of faces. The actual magnitude of the approximation error depends
+on the second-order terms of the Taylor expansion, i.e., on the curvature
+of the underlying smooth surface. From this we can conclude that a suf-
+ficient approximation is possible with just a moderate mesh complexity:
+the vertex density has to be locally adapted to the surface curvature, such
+that flat areas are sparsely sampled, while in curved regions the sampling
+density is higher.
+As stated before, an important topological quality of a surface is whether
+or not it is 2-manifold (short for two-dimensional manifold ), which is the
+case if, for each point, the surface is locally homeomorphic to a disk (or a
+half-disk at boundaries). A triangle mesh is a 2-manifold if it contains nei-
+ther non-manifold edges nor non-manifold vertices nor self-intersections. A
+non-manifold edge has more than two incident triangles and anon-manifold
+Figure 1.5. Each subdivision step halves the edge lengths, increases the number
+of faces by a factor of 4, and reduces the approximation error by a factor of
+about 1
+4. (Image taken from [Botsch et al. 06b].)
+i
+i
+i
+i
+i
+i
+i
+i
+12 1. Surface Representations
+Figure 1.6. Two surface sheets meet at a non-manifold vertex (left). A non-
+manifold edge has more than two incident faces (center). The right configuration,
+although being non-manifold in the strict sense, can be handled by most data
+structures (see Chapter 2). (Image taken from [Botsch 05].)
+vertex is generated by pinching two surface sheets together at that vertex
+such that the vertex is incident to more than one fan of triangles (see
+Figure 1.6). Non-manifold meshes are problematic for most algorithms,
+since around non-manifold configurations there exists no well-defined local
+geodesic neighborhood.
+The famous Euler formula [Coxeter 89] states an interesting relation
+between the numbers of vertices V , edges E, and faces F in a closed and
+connected (but otherwise unstructured) mesh:
+V − E + F = 2 (1 − g), (1.5)
+where g is the genus of the surface and intuitively counts the number of
+handles of an object (see Figure 1.7). Since for most practical applications
+the genus is small compared to the number of elements, the righthand side
+of Equation (1.5) can be assumed to be negligible. Given this and the fact
+that each triangle is bounded by three edges and that each interior manifold
+edge is incident to two triangles, one can derive the following interesting
+mesh statistics:
+Figure 1.7. A sphere of genus 0 (left), a torus of genus 1 (center), and a double-
+torus of genus 2 (right). (Image taken from [Botsch et al. 06b].)
+i
+i
+i
+i
+i
+i
+i
+i
+1.4. Implicit Surface Representations 13
+▶ The number of triangles is twice the number of vertices: F ≈ 2V .
+▶ The number of edges is three times the number of vertices: E ≈ 3V .
+▶ The average vertex valence (number of incident edges) is 6.
+These relations will become important when estimating the runtime com-
+plexity of mesh processing algorithms and when analyzing data structures
+or file formats for triangle meshes in Chapter 2.
+1.4 Implicit Surface Representations
+The basic concept of implicit or volumetric representations for geometric
+models is to characterize the whole embedding space of an object by classi-
+fying each 3D point to lie either inside, outside, or exactly on the surface S
+that bounds a solid object.
+There are different representations for implicit functions, such as al-
+gebraic surfaces, radial basis functions, or discrete voxelizations. In any
+case, the surface S is defined to be the zero-level isosurface of a scalar-
+valued function F : I R3 → I R. By convention, negative function values ofF
+designate points inside the object and positive value points outside the
+object. The zero-level isosurface S contains the points exactly on the sur-
+face, separating the inside from the outside. An implicit surface does not
+have any holes as long as the defining function F is continuous. Moreover,
+since an implicit surface is a level set of a potential function, geometric
+self-intersections cannot occur. This will later be exploited for mesh repair
+(Chapter 8).
+As a consequence, geometric inside/outside queries simplify to function
+evaluations of F and checking the sign of the resulting value. This makes
+implicit representations well suited for constructive solid geometry (CSG),
+where complex objects are constructed by Boolean operations applied to
+geometric primitives (see Figure 1.8). The different Boolean operations
+Figure 1.8. A complex object constructed by Boolean operations. (Image taken
+from [Botsch et al. 06b].)
+i
+i
+i
+i
+i
+i
+i
+i
+14 1. Surface Representations
+can easily be computed by min and max combinations of the individual
+primitives’ implicit functions.
+Implicit surfaces can be deformed by decreasing (= growing) or increas-
+ing (= shrinking) the function values of F locally. Since the structure of F
+(e.g., the voxel grid) is independent from the topology of the level-set sur-
+face, we can easily change the surface topology and connectivity.
+The implicit function F for a given surface S is not uniquely determined
+since, e.g., any scalar multiple λF yields the same zero-set. However, the
+most common and most natural representation is the so-called signed dis-
+tance function , which maps each 3D point x to its signed distance d(x)
+from the surface S: the absolute value |d(x)| measures the distance of x
+to S; the sign indicates whether the point x is inside or outside of the solid
+bounded by S. In addition to inside/outside queries, this representation
+also simplifies distance computations to simple function evaluations, which
+can be used to compute and control the global error for mesh processing
+algorithms [Wu and Kobbelt 03, Botsch et al. 04] or for collision detection
+computations.
+On the other hand, generating sample points on an implicit surface,
+finding geodesic neighborhoods, and even just rendering the surface is rel-
+atively difficult. Moreover, implicit surfaces do not provide any means
+of parameterization, which is why it is very difficult to consistently paste
+textures onto evolving implicit surfaces.
+The most common spatial data structures for implicit surface represen-
+tations are regular grids and adaptive data structures (discussed below).
+1.4.1 Regular Grids
+In order to efficiently process implicit representations, the continuous scalar
+field F is typically discretized in some bounding box around the object us-
+ing a sufficiently dense grid with nodesgijk ∈ I R3. The most basic represen-
+tation, therefore, is a uniform scalar grid of sampled valuesFijk := F (gijk),
+and function values within voxels are derived by trilinear interpolation, thus
+providing quadratic approximation order. However, the memory consump-
+tion of this naive data structure grows cubically if the precision is increased
+by reducing the edge length of grid voxels.
+1.4.2 Adaptive Data Structures
+For better memory efficiency, the sampling density is often adapted to
+the local geometric significance in the scalar field F : since precise signed
+distance values are most important in the vicinity of the surface, a higher
+sampling rate has to be used in these regions only. Instead of a uniform
+3D grid, a hierarchical octree is then used to store the sampled values
+[Samet 94]. The further refinement of an octree cell lying completely inside
+i
+i
+i
+i
+i
+i
+i
+i
+1.5. Conversion Methods 15
+Figure 1.9. Different adaptive approximations of a signed distance field with
+the same accuracy: three-color quadtree (left, 12040 cells), adaptively sampled
+distance fields (ADF) [Frisken et al. 00] (center, 895 cells), and binary space
+partitioning (BSP) tree [Wu and Kobbelt 03] (right, 254 cells). (Image taken
+from [Wu and Kobbelt 03].)
+(black) or outside (white) the object does not improve the approximation
+of the surface S. Adaptively refining only those cells that are intersected
+by the surface (grey) yields a uniformly refined crust of leaf cells around
+the surface and reduces the storage complexity from cubic to quadratic
+(see Figure 1.9 (left)). This structure is called three-color octree because it
+consists of black, white, and grey cells.
+If the local refinement is additionally restricted to those cells where the
+trilinear interpolant deviates more than a prescribed tolerance from the
+actual distance field, the resulting approximation adapts to the locality of
+the surface as well as to its local shape complexity [Frisken et al. 00] (see
+Figure 1.9 (center)). Since extreme refinement is only necessary in regions
+of high surface curvature, this approach reduces the storage complexity
+even further and results in a memory consumption comparable to that of
+mesh representations.
+Similarly, an adaptive binary space-decomposition with linear (instead
+of trilinear) interpolants at the leaves can be used [Wu and Kobbelt 03].
+Although the asymptotic complexity as well as the approximation power
+are the same, the latter method provides slightly better memory efficiency
+at the cost of less compact cells (see Figure 1.9 (right)).
+1.5 Conversion Methods
+In order to exploit the specific advantages of parametric and implicit sur-
+face representations, efficient conversion methods between the two are nec-
+essary. However, notice that both kinds of representations are usually finite
+i
+i
+i
+i
+i
+i
+i
+i
+16 1. Surface Representations
+samplings (e.g., triangle meshes in the parametric case, uniform/adaptive
+grids in the implicit case) and that each conversion corresponds to a re-
+sampling step. Hence, special care has to be taken in order to minimize
+loss of information during these conversion routines.
+1.5.1 Parametric to Implicit
+The conversion of a parametric surface representation to an implicit one
+amounts to the computation or approximation of its signed distance field.
+This can be done very efficiently by voxelization or 3D scan-conversion tech-
+niques [Kaufman 87], but the resulting approximation is piecewise constant
+only. As a surface’s distance field is, in general, not smooth everywhere, a
+piecewise linear or piecewise trilinear approximation seems to be the best
+compromise between approximation accuracy and computational efficiency.
+Since we focus on polygonal meshes as parametric representation in
+this book, the conversion to an implicit representation basically requires
+the computation of signed distances to the triangle mesh at the nodes of a
+(uniform or adaptive) 3D grid.
+Computing the exact distance of a grid node to a given mesh requires to
+calculate the distance to the closest triangle, which can be found efficiently
+by using spatial data structures, e.g., kd-trees [Samet 94]. Notice that, in
+order to compute a signed distance field, one additionally has to determine
+whether a grid node lies inside or outside the object. If g denotes the grid
+node and c its closest point on the surface, then the sign can be derived from
+the angle between the vector g −c and the outer normal n(c): The point g
+is defined to be inside if (g −c)Tn(c) < 0. The robustness and reliability of
+this test strongly depends on the way the normal n(c) is computed. Using
+angle-weighted pseudo-normals for faces, edges, and vertices can be shown
+to yield correct results [Bærentzen and Aanæs 05].
+Computing the distances on the entire grid can be accelerated by fast
+marching methods [Sethian 96]. In a first step, the exact signed distance
+values are computed for all grid nodes in the immediate vicinity of the tri-
+angle mesh. After this initialization, the fast marching method propagates
+distances to the remaining grid nodes with unknown distance value in a
+breadth-first manner.
+1.5.2 Implicit to Parametric
+The conversion from an implicit or volumetric representation to a trian-
+gle mesh, the so-called isosurface extraction, occurs for instance in CSG
+modeling (see Figure 1.8) and in medical applications, e.g., to extract the
+skull surface from a CT head scan. The de-facto standard algorithm for
+isosurface extraction is marching cubes [Lorensen and Cline 87]. This grid-
+based method samples the implicit function on a regular grid and processes
+i
+i
+i
+i
+i
+i
+i
+i
+1.5. Conversion Methods 17
+Figure 1.10. The 15 base configurations of the marching cubes triangulation
+table. The other 241 cases can be found by rotation, reflection, or inversion.
+(Image taken from [Botsch 05].)
+each cell of the discrete distance field separately, thereby allowing for triv-
+ial parallelization. For each cell that is intersected by the isosurface S,
+a surface patch is generated based on local criteria. The collection of all
+these small pieces eventually yields a triangle mesh approximation of the
+complete isosurface S.
+For each grid edge intersecting the surface S, the marching cubes al-
+gorithm computes a sample point that approximates this intersection. In
+terms of the scalar field F , this means that the sign of F differs at the
+grid edge’s endpoints p1 and p2. Since the trilinear approximation F is
+actually linear along the grid edges, the intersection point s can be found
+by linear interpolation of the distance values d1 := F (p1) and d2 := F (p2)
+at the edge’s endpoints:
+s = |d2|
+|d1| + |d2| p1 + |d1|
+|d1| + |d2| p2.
+The resulting sample points of each cell are then connected to a triangulated
+surface patch based on a triangulation look-up table holding all possible
+configurations of edge intersections (see Figure 1.10). Since the possible
+combinatorial configurations are determined by the signs at a cell’s corners,
+their number, and hence the size of the table, is 2 8 = 256.
+i
+i
+i
+i
+i
+i
+i
+i
+18 1. Surface Representations
+Notice that a few cell configurations are ambiguous, which might lead
+to cracks in the extracted surface. A properly modified look-up table yields
+a simple and efficient solution, however, at the price of sacrificing the sym-
+metry with regard to sign inversion of F [Montani et al. 94]. The resulting
+isosurfaces then are watertight 2-manifolds, which is exploited by many
+mesh repair techniques (Chapter 8).
+Marching cubes computes intersection points on the edges of a regular
+grid only, which causes sharp edges or corners to be “chopped off.” A
+faithful reconstruction of sharp features requires additional sample points
+within the cells containing them. The Extended Marching Cubes algorithm
+[Kobbelt et al. 01] therefore examines the distance function’s gradient ∇F
+to detect those cells that contain a sharp feature and to find additional
+sample points by intersecting the estimated tangent planes at the edge
+intersection points of the voxel.
+This principle is depicted in 2D in Figure 1.11, and a 3D example of
+the well-known fandisk dataset is shown in Figure 1.12. An example im-
+plementation of extended marching cubes based on the OpenMesh data
+structure [Botsch et al. 02] can be downloaded from [Kobbelt et al. 05].
+The high triangle complexity of the extracted isosurfaces remains a
+major problem for marching cubes-like approaches. Instead of decimating
+the resulting meshes (see Chapter 7) in a post-process, the algorithm can
+be modified to work directly on adaptively refined octrees [Westermann
+et al. 99].
+Ju et al. [Ju et al. 02] proposed the dual contouring approach, which
+also extracts meshes from adaptive octrees directly. In contrast to march-
+ing cubes, dual contouring generates the vertices in the interior of the
+voxels and constructs a polygon for every voxel edge that intersects the
+isosurface. A drawback, however, is that the dual approach yields non-
+manifold meshes for cell configurations containing multiple surface sheets.
+This can be fixed by the technique described in [Bischoff et al. 05]. An-
+other promising approach is the cubical marching squares algorithm [Ho
+et al. 05], which also provides adaptive and feature-sensitive isosurface
+extraction.
+Finally, an alternative to marching cubes and its variants consists of re-
+fining and filtering a 3D Delaunay triangulation [Boissonnat and Oudot 05].
+The resulting surface mesh is shown to contain only well-shaped triangles
+and faithfully approximates the input surface in terms of both topology and
+geometry. An example implementation of a Delaunay refinement approach
+can be downloaded from the website of the Computational Geometry Al-
+gorithms Library (CGAL) [CGAL 09].
+i
+i
+i
+i
+i
+i
+i
+i
+1.6. Summary and Further Reading 19
+Figure 1.11. By using point and normal information on both sides of the sharp
+feature, one can find a good estimate for the feature point at the intersection
+of the tangent elements. The dashed lines are the result the standard marching
+cubes algorithm would produce, and the bold lines are the tangents used in the
+extended algorithm. (Image taken from [Botsch 05].)
+Figure 1.12. Two reconstructions of the fandisk dataset from a 65 × 65 × 65
+sampling of its signed distance field. The standard marching cubes algorithm
+leads to severe alias artifacts near sharp features (top), whereas the feature-
+sensitive isosurface extraction faithfully reconstructs them (bottom).
+i
+i
+i
+i
+i
+i
+i
+i
+20 1. Surface Representations
+1.6 Summary and Further Reading
+In this chapter we discussed the advantages and disadvantages of various
+mathematical geometry representations. The two major concepts of para-
+metric vs. implicit representations have almost complementary strengths
+and weaknesses. Parametric surfaces can capture even the finest detail, are
+easy to sample, and can be modified intuitively but it is difficult to answer
+distance queries and topological changes require a major restructuring. On
+the other hand, topological changes and distance queries are easy for im-
+plicit surfaces but sampling and shape editing is not straightforward and
+the geometric detail resolution depends on the voxel size.
+There is the approach ofhybrid representations [Bischoff and Kobbelt 05,
+Bischoff et al. 05], which merges the two concepts such that the advantages
+of both can be combined. For example, an adaptive octree with a set of
+triangles stored in each voxel cell supports efficient distance queries as well
+as a high detail resolution.
+There are many other conversion techniques for further reading. Shen
+et al. [Shen et al. 04], e.g., have proposed an approach which converts a
+polygon soup into implicit surfaces, which can range from interpolating to
+approximating with adjustable smoothness and tolerance.
+Besides the approaches described here, which are most relevant for
+the techniques presented in this book, there are many other representa-
+tions suitable for efficient geometry processing. Radial basis functions
+[Light 92] are a prominent example, as are partition of unity implicits
+[Ohtake et al. 03] and point-based representations [Pauly 03, Kobbelt and
+Botsch 04]—just to mention a few.
+i
+i
+i
+i
+i
+i
+i
+i
+MESH DATA
+STRUCTURES
+The efficiency and memory consumption of the geometric modeling algo-
+rithms presented in this book largely depend on the underlying surface
+mesh data structures. This chapter provides a brief overview of the most
+common data structures of the wide variety described in the literature.
+Choosing a mesh data structure requires taking into account topological
+as well as algorithmic considerations:
+▶ Topological requirements. Which kinds of meshes need to be repre-
+sented by the data structure? Can we rely on 2-manifold meshes,
+or do we need to represent complex edges and singular vertices (see
+Section 1.3.3)? Can we restrict ourselves to pure triangle meshes, or
+do we need to represent arbitrary polygonal meshes? Are the meshes
+regular, semi-regular, irregular (see Chapter 6)? Do we want to build
+up a hierarchy of increasingly refined meshes (see Section 1.3.2)?
+▶ Algorithmic requirements. Which kinds of algorithms will be operating
+on the data structure? Do we simply want to render the mesh, or
+do we need efficient access to local neighborhoods of vertices, edges,
+and faces? Will the mesh be static or will its geometry and/or con-
+nectivity change over time? Do we need to associate additional data
+with vertices, edges, and faces of the mesh? Do we have special re-
+quirements in terms of memory consumption (i.e., are the data sets
+massive)?
+Evaluating a data structure requires measuring various criteria such
+as (a) time to construct it during preprocessing, (b) time to answer a
+21

@@ -20,6 +20,7 @@ from deepseek_api import (
     chat_completion,
     chat_completion_stream,
     run_chat_with_tools,
+    validate_messages_for_provider,
 )
 from workspace_tools import WorkspaceToolSession, openai_tool_specs
 
@@ -71,6 +72,10 @@ def run_harness(
     on_stream_token: Optional[Callable[[str], None]] = None,
 ) -> str:
     """执行一次“发问→得到回答”，按 config 决定是否走工具循环/流式。"""
+    vision_err = validate_messages_for_provider(messages, config.provider)
+    if vision_err:
+        raise ValueError(vision_err)
+
     if config.use_tools:
         session = WorkspaceToolSession(config.workspace, http_proxy=config.proxy_url)
         tools = openai_tool_specs(

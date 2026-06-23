@@ -1,3 +1,4 @@
+import base64
 import errno
 import json
 import os
@@ -5,7 +6,7 @@ import select
 import socket
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 # 流式 SSE：短轮询便于 Stop；总等待时长由 opener.open(timeout=…) 控制，思考模型需足够大
 STREAM_READ_POLL_SEC = 1.0
@@ -59,6 +60,15 @@ KIMI_MODEL_ALIASES: Dict[str, str] = {
 PROVIDER_DEEPSEEK = "deepseek"
 PROVIDER_KIMI = "kimi"
 PROVIDER_OLLAMA = "ollama"
+
+# 多模态：单次 user 消息最多图片数；单张原始字节上限（base64 后更大）
+VISION_MAX_IMAGES = 4
+VISION_MAX_IMAGE_BYTES = 4 * 1024 * 1024
+
+# OpenAI 兼容 content part
+ContentPart = Dict[str, Any]
+UserContent = Union[str, List[ContentPart]]
+ChatMessage = Dict[str, Any]
 
 # 本地 Ollama OpenAI 兼容端点：POST /v1/chat/completions；列举模型：GET /api/tags 或 GET /v1/models
 # 可通过环境变量 OLLAMA_API_BASE / OLLAMA_HOST（任一为根 URL，无尾斜杠）或 UI 覆盖默认
@@ -614,6 +624,179 @@ def chat_completion_stream(
             c = _normalize_delta_piece(delta.get("content"))
             if c:
                 yield c
+
+
+def provider_supports_vision(provider: str) -> bool:
+    """
+    当前集成是否可向 API 发送 image_url 多模态 user 消息。
+
+    DeepSeek 官方 Chat Completions（deepseek-v4-*）截至文档仍仅接受纯文本 content；
+    发送 image_url 会返回 400（unknown variant image_url, expected text）。
+    Kimi（Moonshot）与本地 Ollama 视觉模型支持 OpenAI 风格 content 数组。
+    """
+    p = (provider or PROVIDER_DEEPSEEK).strip().lower()
+    return p in (PROVIDER_KIMI, PROVIDER_OLLAMA)
+
+
+def vision_unsupported_hint(provider: str) -> str:
+    p = (provider or PROVIDER_DEEPSEEK).strip().lower()
+    if p == PROVIDER_DEEPSEEK:
+        return (
+            "DeepSeek 官方 API（deepseek-v4-flash / deepseek-v4-pro）目前不支持图片输入；"
+            "网页版 chat 有视觉能力但 API 尚未开放。"
+            "请切换到 Kimi 视觉模型或本地 Ollama 多模态模型。"
+        )
+    return f"提供方 {p} 未标记为支持视觉输入。"
+
+
+def image_bytes_to_data_url(data: bytes, mime: str = "image/png") -> str:
+    enc = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{enc}"
+
+
+def build_user_message_content(text: str, image_data_urls: Optional[List[str]] = None) -> UserContent:
+    """构造 user message 的 content：纯文本 str，或含 image_url + text 的数组。"""
+    urls = [u.strip() for u in (image_data_urls or []) if isinstance(u, str) and u.strip()]
+    t = (text or "").strip()
+    if not urls:
+        return t
+    parts: List[ContentPart] = []
+    for url in urls[:VISION_MAX_IMAGES]:
+        parts.append({"type": "image_url", "image_url": {"url": url}})
+    if t:
+        parts.append({"type": "text", "text": t})
+    return parts
+
+
+def redact_image_url_for_preview(url: str) -> str:
+    """预览 JSON 用：用短占位符替代 data URL，避免 megabytes 级 dumps。"""
+    u = (url or "").strip()
+    if not u:
+        return "[empty image]"
+    if not u.startswith("data:"):
+        return u if len(u) <= 96 else u[:80] + "…"
+    header, _, b64 = u.partition(",")
+    mime = header.split(":", 1)[-1].split(";", 1)[0] if ":" in header else "image"
+    approx = len(b64) * 3 // 4 if b64 else 0
+    if approx >= 1024 * 1024:
+        size = f"{approx / (1024 * 1024):.1f}MB"
+    elif approx >= 1024:
+        size = f"{approx / 1024:.0f}KB"
+    else:
+        size = f"{approx}B"
+    return f"[{mime} {size}; omitted in preview]"
+
+
+def redact_content_for_preview(content: Any, *, hide_images: bool = True) -> Any:
+    if not hide_images or isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return content
+    out: List[ContentPart] = []
+    for item in content:
+        if not isinstance(item, dict):
+            out.append(item)
+            continue
+        if item.get("type") == "image_url":
+            iu = item.get("image_url")
+            url = iu.get("url") if isinstance(iu, dict) else iu
+            if hide_images:
+                out.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": redact_image_url_for_preview(str(url or "")),
+                        },
+                    }
+                )
+            else:
+                out.append(dict(item))
+        else:
+            out.append(dict(item))
+    return out
+
+
+def redact_messages_for_preview(
+    messages: List[Dict[str, Any]],
+    *,
+    hide_images: bool = True,
+) -> List[Dict[str, Any]]:
+    if not hide_images:
+        return messages
+    return [
+        {
+            **m,
+            "content": redact_content_for_preview(m.get("content"), hide_images=True),
+        }
+        for m in messages
+    ]
+
+
+def count_images_in_content(content: Any) -> int:
+    if not isinstance(content, list):
+        return 0
+    n = 0
+    for item in content:
+        if isinstance(item, dict) and item.get("type") == "image_url":
+            n += 1
+    return n
+
+
+def content_to_display_text(content: Any) -> str:
+    """将 message content 转为聊天区可显示的纯文本摘要。"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts: List[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text":
+                t = item.get("text")
+                if t is not None:
+                    texts.append(str(t))
+        img_n = count_images_in_content(content)
+        body = "\n".join(texts)
+        if img_n:
+            suffix = f"\n[{img_n} 张图片]" if body else f"[{img_n} 张图片]"
+            return body + suffix
+        return body
+    return str(content)
+
+
+def image_data_urls_from_content(content: Any) -> List[str]:
+    """从 multimodal content 提取 data URL（用于 UI 缩略图）。"""
+    if not isinstance(content, list):
+        return []
+    out: List[str] = []
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") != "image_url":
+            continue
+        iu = item.get("image_url")
+        if isinstance(iu, dict):
+            url = iu.get("url")
+            if isinstance(url, str) and url.strip():
+                out.append(url.strip())
+        elif isinstance(iu, str) and iu.strip():
+            out.append(iu.strip())
+    return out
+
+
+def validate_messages_for_provider(
+    messages: List[Dict[str, Any]],
+    provider: str,
+) -> Optional[str]:
+    """若 messages 含图片但提供方不支持视觉，返回错误说明；否则 None。"""
+    if provider_supports_vision(provider):
+        return None
+    for m in messages:
+        if m.get("role") != "user":
+            continue
+        if count_images_in_content(m.get("content")) > 0:
+            return vision_unsupported_hint(provider)
+    return None
 
 
 def build_simple_messages(

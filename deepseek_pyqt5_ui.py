@@ -2,14 +2,18 @@ import sys
 import urllib.error
 import html
 import json
-from dataclasses import dataclass
+import base64
+import hashlib
+import re
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from PyQt5.QtCore import QThread, Qt, pyqtSignal, QSettings
+from PyQt5.QtCore import QBuffer, QIODevice, QMimeData, QThread, Qt, pyqtSignal, QSettings
 from PyQt5.QtCore import QTimer
-from PyQt5.QtGui import QTextCursor
+from PyQt5.QtGui import QImage, QKeySequence, QPixmap, QTextCursor
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -22,6 +26,7 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QMenu,
     QPushButton,
     QPlainTextEdit,
     QTextBrowser,
@@ -34,6 +39,8 @@ from PyQt5.QtWidgets import (
     QWidget,
     QListWidget,
     QListWidgetItem,
+    QAbstractItemView,
+    QInputDialog,
 )
 
 from deepseek_api import (
@@ -43,14 +50,24 @@ from deepseek_api import (
     PROVIDER_OLLAMA,
     STREAM_TIMEOUT_DEFAULT,
     STREAM_TIMEOUT_UNLIMITED,
+    VISION_MAX_IMAGE_BYTES,
+    VISION_MAX_IMAGES,
+    build_user_message_content,
     chat_completion,
     check_available,
+    content_to_display_text,
     effective_stream_timeout,
     effective_temperature_for_resolved_model,
     explain_http_error,
+    image_bytes_to_data_url,
+    image_data_urls_from_content,
+    provider_supports_vision,
     resolve_chat_endpoint,
     resolve_model,
     StreamInterrupted,
+    validate_messages_for_provider,
+    vision_unsupported_hint,
+    redact_messages_for_preview,
 )
 from markdown_renderer import markdown_to_html
 from deepseek_harness import (
@@ -77,6 +94,118 @@ from prompts_manager import (
     save_prompts,
 )
 from workspace_tools import WorkspaceToolSession, openai_tool_specs
+from todo_model import (
+    TodoItem,
+    extract_todos_from_reply,
+    todos_from_json_list,
+    todos_system_hint,
+    todos_to_json_list,
+)
+
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+CHAT_THUMB_MAX_W = 240
+CHAT_THUMB_MAX_H = 180
+
+
+def _data_url_cache_key(data_url: str) -> str:
+    b64 = data_url.split(",", 1)[-1] if "," in data_url else data_url
+    return hashlib.sha256(b64.encode("ascii", errors="ignore")).hexdigest()
+
+
+def data_url_to_chat_thumbnail(data_url: str) -> Optional[Tuple[str, int, int]]:
+    """
+    为 QTextBrowser 生成小缩略图 data URL 及显示尺寸。
+    Qt 富文本对 img 常按原图 intrinsic 尺寸排版，直接嵌入大图 base64 会产生大量留白。
+    """
+    if not data_url or not data_url.startswith("data:"):
+        return None
+    b64_part = data_url.split(",", 1)[-1] if "," in data_url else ""
+    try:
+        raw = base64.b64decode(b64_part, validate=False)
+    except Exception:
+        return None
+    if not raw:
+        return None
+    pix = QPixmap()
+    if not pix.loadFromData(raw):
+        return None
+    scaled = pix.scaled(
+        CHAT_THUMB_MAX_W,
+        CHAT_THUMB_MAX_H,
+        Qt.KeepAspectRatio,
+        Qt.SmoothTransformation,
+    )
+    w, h = scaled.width(), scaled.height()
+    if w < 1 or h < 1:
+        return None
+    buf = QBuffer()
+    buf.open(QIODevice.WriteOnly)
+    if not scaled.save(buf, "JPEG", quality=82):
+        return None
+    thumb_url = image_bytes_to_data_url(bytes(buf.data()), "image/jpeg")
+    return thumb_url, w, h
+
+
+def _mime_for_path(path: Path) -> str:
+    ext = path.suffix.lower().lstrip(".")
+    if ext in ("jpg", "jpeg"):
+        return "image/jpeg"
+    if ext == "gif":
+        return "image/gif"
+    if ext == "webp":
+        return "image/webp"
+    if ext == "bmp":
+        return "image/bmp"
+    return "image/png"
+
+
+def _qimage_to_png_bytes(qimg: QImage) -> bytes:
+    buf = QBuffer()
+    buf.open(QIODevice.WriteOnly)
+    scaled = qimg
+    if scaled.width() > 2048 or scaled.height() > 2048:
+        scaled = scaled.scaled(2048, 2048, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    if not scaled.save(buf, "PNG"):
+        raise ValueError("无法将图片编码为 PNG")
+    return bytes(buf.data())
+
+
+class ChatInputEdit(QPlainTextEdit):
+    """支持从剪贴板或拖拽粘贴图片的输入框。"""
+
+    image_attached = pyqtSignal(str)
+
+    def insertFromMimeData(self, source: QMimeData) -> None:
+        if source.hasImage():
+            img = source.imageData()
+            if img is not None:
+                qimg = img if isinstance(img, QImage) else img.toImage()
+                if not qimg.isNull():
+                    try:
+                        data = _qimage_to_png_bytes(qimg)
+                        self.image_attached.emit(image_bytes_to_data_url(data, "image/png"))
+                    except ValueError:
+                        pass
+                    return
+        if source.hasUrls():
+            for url in source.urls():
+                local = url.toLocalFile()
+                if not local:
+                    continue
+                p = Path(local)
+                if p.suffix.lower() in _IMAGE_SUFFIXES and p.is_file():
+                    try:
+                        raw = p.read_bytes()
+                        if len(raw) > VISION_MAX_IMAGE_BYTES:
+                            continue
+                        self.image_attached.emit(
+                            image_bytes_to_data_url(raw, _mime_for_path(p))
+                        )
+                    except OSError:
+                        continue
+                    return
+        super().insertFromMimeData(source)
+
 
 class AskWorker(QThread):
     chunk = pyqtSignal(str)
@@ -203,6 +332,46 @@ class SessionState:
     messages: List[Dict[str, Any]]
     pending_stream_text: str = ""
     awaiting_response: bool = False
+    todos: List[Dict[str, Any]] = field(default_factory=list)
+    todo_mode: bool = False
+
+
+class TodoEditDialog(QDialog):
+    """编辑单条 Todo（content + tags）。"""
+
+    def __init__(self, parent=None, item: Optional[TodoItem] = None):
+        super().__init__(parent)
+        self.setWindowTitle("编辑 Todo")
+        self.resize(480, 200)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("内容"))
+        self.content_edit = QPlainTextEdit()
+        self.content_edit.setFixedHeight(72)
+        layout.addWidget(self.content_edit)
+        layout.addWidget(QLabel("标签（逗号分隔）"))
+        self.tags_edit = QLineEdit()
+        self.tags_edit.setPlaceholderText("例如：工作, 紧急")
+        layout.addWidget(self.tags_edit)
+        row = QHBoxLayout()
+        ok_btn = QPushButton("确定")
+        cancel_btn = QPushButton("取消")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+        row.addStretch(1)
+        row.addWidget(ok_btn)
+        row.addWidget(cancel_btn)
+        layout.addLayout(row)
+        self._item_id = item.id if item else uuid.uuid4().hex[:12]
+        if item:
+            self.content_edit.setPlainText(item.content)
+            self.tags_edit.setText(", ".join(item.tags))
+
+    def build_item(self) -> Optional[TodoItem]:
+        content = self.content_edit.toPlainText().strip()
+        if not content:
+            return None
+        tags = [t.strip() for t in self.tags_edit.text().split(",") if t.strip()]
+        return TodoItem(content=content, tags=tags, id=self._item_id)
 
 
 class SystemPromptDialog(QDialog):
@@ -485,9 +654,13 @@ def _flatten_messages_for_transcript(messages: List[Dict[str, Any]]) -> str:
     for m in messages:
         role = str(m.get("role", "?"))
         content = m.get("content")
-        if not isinstance(content, str):
-            content = json.dumps(content, ensure_ascii=False) if content is not None else ""
-        parts.append(f"### {role}\n{content}")
+        if isinstance(content, str):
+            text = content
+        else:
+            text = content_to_display_text(content)
+            if content is not None and not isinstance(content, str):
+                text = text + "\n" + json.dumps(content, ensure_ascii=False)
+        parts.append(f"### {role}\n{text}")
     return "\n\n".join(parts)
 
 
@@ -589,14 +762,22 @@ class MainWindow(QMainWindow):
         self._models_refresh_worker = None
         self._smart_save_pending: Optional[Dict[str, Any]] = None
         self.messages = []
+        self.todos: List[TodoItem] = []
+        self._todo_list_refreshing = False
         self.current_system_prompt = "You are a helpful assistant."
         self.pending_stream_text = ""
         self.awaiting_response = False
         self._render_scheduled = False
+        self._pending_image_urls: List[str] = []
+        self._pending_image_thumbs: Dict[str, QPixmap] = {}
+        self._chat_thumb_cache: Dict[str, Tuple[str, int, int]] = {}
         self.logs_dir = Path("./logs")
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.settings = QSettings("DeepSeekAssistant", "PyQtClient")
         self._skill_catalog = []
+        self._preview_debounce = QTimer(self)
+        self._preview_debounce.setSingleShot(True)
+        self._preview_debounce.timeout.connect(self.update_next_context_preview)
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -700,21 +881,51 @@ class MainWindow(QMainWindow):
         self.preview_show_tools_checkbox.toggled.connect(
             lambda v: self.settings.setValue("preview_show_tools", bool(v))
         )
+        pi = self.settings.value("preview_show_images", False)
+        if isinstance(pi, str):
+            pi = pi.lower() in ("1", "true", "yes")
+        self.preview_show_images_checkbox = QCheckBox("images")
+        self.preview_show_images_checkbox.setChecked(bool(pi))
+        self.preview_show_images_checkbox.setToolTip(
+            "显示 messages 中的完整 image_url base64（体积大、会拖慢输入；默认隐藏为占位符）"
+        )
+        self.preview_show_images_checkbox.toggled.connect(
+            lambda v: self.settings.setValue("preview_show_images", bool(v))
+        )
         preview_filters.addWidget(self.preview_show_meta_checkbox)
         preview_filters.addWidget(self.preview_show_messages_checkbox)
         preview_filters.addWidget(self.preview_show_tools_checkbox)
+        preview_filters.addWidget(self.preview_show_images_checkbox)
         preview_filters.addStretch(1)
         preview_layout.addLayout(preview_filters)
 
         content_split.addWidget(preview_wrap)
 
         right_layout.addWidget(QLabel("输入"))
-        self.input_box = QPlainTextEdit()
-        self.input_box.setPlaceholderText("在这里输入你的问题…")
+        self.attachments_widget = QWidget()
+        self.attachments_layout = QHBoxLayout(self.attachments_widget)
+        self.attachments_layout.setContentsMargins(0, 0, 0, 0)
+        self.attachments_layout.setSpacing(6)
+        self.attachments_widget.setVisible(False)
+        right_layout.addWidget(self.attachments_widget)
+
+        self.input_box = ChatInputEdit()
+        self.input_box.setPlaceholderText(
+            "在这里输入你的问题…（Ctrl+V 可粘贴图片；亦可将图片拖入此框）"
+        )
         self.input_box.setFixedHeight(96)
+        self.input_box.setAcceptDrops(True)
+        self.input_box.image_attached.connect(self._on_input_image_attached)
         right_layout.addWidget(self.input_box)
 
         buttons_row = QHBoxLayout()
+        self.attach_image_btn = QPushButton("图片…")
+        self.attach_image_btn.setToolTip(
+            f"选择图片附件（最多 {VISION_MAX_IMAGES} 张，单张 ≤ {VISION_MAX_IMAGE_BYTES // (1024 * 1024)}MB）。"
+            "Kimi / Ollama 视觉模型可用；DeepSeek 官方 API 暂不支持。"
+        )
+        self.clear_images_btn = QPushButton("清除图片")
+        self.clear_images_btn.setEnabled(False)
         self.ask_button = QPushButton("Send")
         self.stop_button = QPushButton("Stop")
         self.stop_button.setEnabled(False)
@@ -723,6 +934,8 @@ class MainWindow(QMainWindow):
         self.save_button = QPushButton("Save")
         self.smart_save_button = QPushButton("Smart Save")
         self.smart_save_button.setToolTip("由模型根据对话命名并保存到 logs（无前缀摘要）")
+        buttons_row.addWidget(self.attach_image_btn)
+        buttons_row.addWidget(self.clear_images_btn)
         buttons_row.addWidget(self.ask_button)
         buttons_row.addWidget(self.stop_button)
         buttons_row.addWidget(self.clear_history_button)
@@ -749,6 +962,7 @@ class MainWindow(QMainWindow):
             "来自 DeepSeek / Kimi GET /v1/models 与本地 Ollama（/api/tags）；标注 [DS]/[Kimi]/[Ollama]。"
             "Kimi 需 KIMI_KEY；DeepSeek 需 DS_KEY；Ollama 无需密钥（默认 http://127.0.0.1:11434，可用下方地址或环境变量"
             " OLLAMA_HOST / OLLAMA_API_BASE 覆盖）。点击「刷新模型」合并列表。"
+            "图片输入：Kimi 视觉模型与 Ollama 多模态模型支持；DeepSeek 官方 API 暂不支持。"
         )
         self.refresh_models_btn = QPushButton("刷新模型")
         self.refresh_models_btn.setToolTip(
@@ -970,6 +1184,55 @@ class MainWindow(QMainWindow):
         skills_layout.addWidget(self.skills_list, 1)
         left_tabs.addTab(skills_tab, "Skills")
 
+        # ── Tab: Todo ───────────────────────────────────────────────────────
+        todo_tab = QWidget()
+        todo_layout = QVBoxLayout(todo_tab)
+        todo_layout.setContentsMargins(8, 8, 8, 8)
+        todo_layout.setSpacing(6)
+
+        todo_top = QHBoxLayout()
+        self.todo_mode_checkbox = QCheckBox("Todo 模式")
+        self.todo_mode_checkbox.setToolTip(
+            "启用后：system prompt 注入 Todo 输出约定；每次助手回复末尾的 ```todos``` 块"
+            "会被解析为 2 条待办并追加到下列列表（列表中不显示该代码块）。"
+        )
+        tm_default = self.settings.value("todo_mode_default", False)
+        if isinstance(tm_default, str):
+            tm_default = tm_default.lower() in ("1", "true", "yes")
+        self.todo_mode_checkbox.setChecked(bool(tm_default))
+        self.todo_mode_checkbox.toggled.connect(self._on_todo_mode_toggled)
+        self.todo_add_btn = QPushButton("新增")
+        self.todo_edit_btn = QPushButton("编辑")
+        self.todo_delete_btn = QPushButton("删除")
+        self.todo_clear_btn = QPushButton("清空")
+        todo_top.addWidget(self.todo_mode_checkbox)
+        todo_top.addStretch(1)
+        todo_top.addWidget(self.todo_add_btn)
+        todo_top.addWidget(self.todo_edit_btn)
+        todo_top.addWidget(self.todo_delete_btn)
+        todo_top.addWidget(self.todo_clear_btn)
+        todo_layout.addLayout(todo_top)
+
+        todo_layout.addWidget(
+            QLabel("拖动调整优先级；双击条目直接提交询问；F2 或右键编辑。")
+        )
+        self.todo_list = QListWidget()
+        self.todo_list.setDragDropMode(QAbstractItemView.InternalMove)
+        self.todo_list.setDefaultDropAction(Qt.MoveAction)
+        self.todo_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.todo_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        todo_layout.addWidget(self.todo_list, 1)
+        left_tabs.addTab(todo_tab, "Todo")
+
+        self.todo_add_btn.clicked.connect(self.on_todo_add)
+        self.todo_edit_btn.clicked.connect(self.on_todo_edit)
+        self.todo_delete_btn.clicked.connect(self.on_todo_delete)
+        self.todo_clear_btn.clicked.connect(self.on_todo_clear)
+        self.todo_list.itemDoubleClicked.connect(self.on_todo_ask)
+        self.todo_list.customContextMenuRequested.connect(self._on_todo_context_menu)
+        self.todo_list.model().rowsMoved.connect(self._on_todos_reordered)
+        QShortcut(QKeySequence("F2"), self.todo_list, activated=self.on_todo_edit)
+
         # 须在创建 skills_list 之后再连接（初始化早期会调用 _on_tools_toggled，不能在其中刷新预览）
         self.tools_checkbox.toggled.connect(self.update_next_context_preview)
 
@@ -978,12 +1241,14 @@ class MainWindow(QMainWindow):
         self.clear_catalog_cache_btn.clicked.connect(self.on_clear_catalog_cache)
 
         self.ask_button.clicked.connect(self.on_ask)
+        self.attach_image_btn.clicked.connect(self.on_attach_images)
+        self.clear_images_btn.clicked.connect(self._clear_pending_images)
         self.stop_button.clicked.connect(self.on_stop)
         self.clear_history_button.clicked.connect(self.on_clear_history)
         self.load_button.clicked.connect(self.on_load_conversation)
         self.save_button.clicked.connect(self.on_save_conversation)
         self.smart_save_button.clicked.connect(self.on_smart_save)
-        self.input_box.textChanged.connect(self.update_next_context_preview)
+        self.input_box.textChanged.connect(self._schedule_preview_update)
         self.preview_checkbox.toggled.connect(self.update_next_context_preview)
         self.model_combo.currentIndexChanged.connect(self.update_next_context_preview)
         self.model_combo.currentIndexChanged.connect(self._persist_model_choice)
@@ -995,13 +1260,14 @@ class MainWindow(QMainWindow):
         self.allow_commands_checkbox.toggled.connect(self.update_next_context_preview)
         self.web_search_checkbox.toggled.connect(self.update_next_context_preview)
         self.auto_skill_checkbox.toggled.connect(self.update_next_context_preview)
-        self.workspace_edit.textChanged.connect(self.update_next_context_preview)
+        self.workspace_edit.textChanged.connect(self._schedule_preview_update)
         self.skills_list.itemChanged.connect(self.update_next_context_preview)
         self.context_list.model().rowsInserted.connect(lambda *a: self.update_next_context_preview())
         self.context_list.model().rowsRemoved.connect(lambda *a: self.update_next_context_preview())
         self.preview_show_meta_checkbox.toggled.connect(self.update_next_context_preview)
         self.preview_show_messages_checkbox.toggled.connect(self.update_next_context_preview)
         self.preview_show_tools_checkbox.toggled.connect(self.update_next_context_preview)
+        self.preview_show_images_checkbox.toggled.connect(self.update_next_context_preview)
         self.commit_gen_btn.clicked.connect(self.on_generate_commit_message)
         self.commit_do_btn.clicked.connect(self.on_do_git_commit)
 
@@ -1038,11 +1304,134 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(max(0, int(delay_ms)), _do)
 
+    def _schedule_preview_update(self, delay_ms: int = 300) -> None:
+        """输入框等高频变更时节流预览刷新，避免每键 dump 含 base64 的巨大 JSON。"""
+        if not self.preview_checkbox.isChecked():
+            return
+        self._preview_debounce.start(max(50, int(delay_ms)))
+
     def workspace_path(self) -> Path:
         text = self.workspace_edit.text().strip()
         if not text:
             return Path.cwd().resolve()
         return Path(text).expanduser().resolve()
+
+    def _on_input_image_attached(self, data_url: str) -> None:
+        self._add_pending_image_data_url(data_url)
+
+    def _add_pending_image_data_url(self, data_url: str) -> None:
+        if not data_url or not data_url.startswith("data:"):
+            return
+        if len(self._pending_image_urls) >= VISION_MAX_IMAGES:
+            QMessageBox.warning(
+                self,
+                "图片",
+                f"最多附加 {VISION_MAX_IMAGES} 张图片。",
+            )
+            return
+        if data_url in self._pending_image_urls:
+            return
+        self._ensure_thumbnail_for_url(data_url)
+        self._pending_image_urls.append(data_url)
+        self._refresh_attachment_bar()
+        self.update_next_context_preview()
+        prov = self.current_provider() if self._model_choice_ready() else PROVIDER_DEEPSEEK
+        if not provider_supports_vision(prov):
+            self.statusBar().showMessage(vision_unsupported_hint(prov), 8000)
+
+    def _ensure_thumbnail_for_url(self, data_url: str) -> None:
+        if data_url in self._pending_image_thumbs:
+            return
+        pix = QPixmap()
+        b64_part = data_url.split(",", 1)[-1] if "," in data_url else ""
+        try:
+            raw = base64.b64decode(b64_part, validate=False)
+            loaded = pix.loadFromData(raw) if raw else False
+        except Exception:
+            loaded = False
+        if loaded:
+            self._pending_image_thumbs[data_url] = pix.scaled(
+                56, 56, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+
+    def _clear_pending_images(self) -> None:
+        self._pending_image_urls.clear()
+        self._pending_image_thumbs.clear()
+        self._refresh_attachment_bar()
+        self.update_next_context_preview()
+
+    def _refresh_attachment_bar(self) -> None:
+        while self.attachments_layout.count():
+            item = self.attachments_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        if not self._pending_image_urls:
+            self.attachments_widget.setVisible(False)
+            self.clear_images_btn.setEnabled(False)
+            return
+        self.attachments_widget.setVisible(True)
+        self.clear_images_btn.setEnabled(True)
+        for idx, url in enumerate(self._pending_image_urls):
+            wrap = QWidget()
+            row = QVBoxLayout(wrap)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(2)
+            thumb = QLabel()
+            thumb.setFixedSize(56, 56)
+            thumb.setStyleSheet("border:1px solid #ccc; border-radius:4px;")
+            cached = self._pending_image_thumbs.get(url)
+            if cached is not None and not cached.isNull():
+                thumb.setPixmap(cached)
+            else:
+                thumb.setText("img")
+                thumb.setAlignment(Qt.AlignCenter)
+            rm = QPushButton("×")
+            rm.setFixedWidth(24)
+            rm.clicked.connect(lambda _checked=False, i=idx: self._remove_pending_image(i))
+            row.addWidget(thumb)
+            row.addWidget(rm, 0, Qt.AlignHCenter)
+            self.attachments_layout.addWidget(wrap)
+        self.attachments_layout.addStretch(1)
+
+    def _remove_pending_image(self, index: int) -> None:
+        if 0 <= index < len(self._pending_image_urls):
+            url = self._pending_image_urls.pop(index)
+            self._pending_image_thumbs.pop(url, None)
+            self._refresh_attachment_bar()
+            self.update_next_context_preview()
+
+    def on_attach_images(self) -> None:
+        if len(self._pending_image_urls) >= VISION_MAX_IMAGES:
+            QMessageBox.warning(self, "图片", f"最多附加 {VISION_MAX_IMAGES} 张图片。")
+            return
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "选择图片",
+            "",
+            "Images (*.png *.jpg *.jpeg *.gif *.webp *.bmp)",
+        )
+        for f in files:
+            if len(self._pending_image_urls) >= VISION_MAX_IMAGES:
+                break
+            p = Path(f)
+            if p.suffix.lower() not in _IMAGE_SUFFIXES:
+                continue
+            try:
+                raw = p.read_bytes()
+            except OSError as exc:
+                QMessageBox.warning(self, "图片", f"无法读取 {p.name}: {exc}")
+                continue
+            if len(raw) > VISION_MAX_IMAGE_BYTES:
+                QMessageBox.warning(
+                    self,
+                    "图片",
+                    f"{p.name} 超过 {VISION_MAX_IMAGE_BYTES // (1024 * 1024)}MB 上限。",
+                )
+                continue
+            self._add_pending_image_data_url(
+                image_bytes_to_data_url(raw, _mime_for_path(p))
+            )
 
     def current_provider(self) -> str:
         d = self.model_combo.currentData()
@@ -1422,6 +1811,160 @@ class MainWindow(QMainWindow):
         self.allow_commands_checkbox.setEnabled(on)
         self.web_search_checkbox.setEnabled(on)
 
+    def _todo_mode_enabled(self) -> bool:
+        return self.todo_mode_checkbox.isChecked()
+
+    def _on_todo_mode_toggled(self, checked: bool) -> None:
+        self.settings.setValue("todo_mode_default", bool(checked))
+        if 0 <= self._active_session_index < len(self.sessions):
+            self.sessions[self._active_session_index].todo_mode = bool(checked)
+        self.update_next_context_preview()
+
+    def _sync_todos_to_session(self) -> None:
+        if self._active_session_index < 0 or self._active_session_index >= len(self.sessions):
+            return
+        self.sessions[self._active_session_index].todos = todos_to_json_list(self.todos)
+
+    def _refresh_todo_list_ui(self) -> None:
+        self._todo_list_refreshing = True
+        self.todo_list.clear()
+        for i, t in enumerate(self.todos):
+            item = QListWidgetItem(f"{i + 1}. {t.display_line()}")
+            item.setData(Qt.UserRole, t.to_dict())
+            self.todo_list.addItem(item)
+        self._todo_list_refreshing = False
+
+    def _todos_from_list_widget(self) -> List[TodoItem]:
+        out: List[TodoItem] = []
+        for i in range(self.todo_list.count()):
+            it = self.todo_list.item(i)
+            if it is None:
+                continue
+            d = it.data(Qt.UserRole)
+            if isinstance(d, dict):
+                out.append(TodoItem.from_dict(d))
+        return out
+
+    def _on_todos_reordered(self, *_args: Any) -> None:
+        if self._todo_list_refreshing:
+            return
+        self.todos = self._todos_from_list_widget()
+        self._refresh_todo_list_ui()
+        self._sync_todos_to_session()
+
+    def _append_todos(self, items: List[TodoItem]) -> None:
+        if not items:
+            return
+        self.todos.extend(items)
+        self._sync_todos_to_session()
+        self._refresh_todo_list_ui()
+
+    def _finalize_assistant_answer(self, raw: str) -> str:
+        if not self._todo_mode_enabled():
+            return raw
+        display, new_items = extract_todos_from_reply(raw)
+        if new_items:
+            self._append_todos(new_items)
+        return display
+
+    def on_todo_add(self) -> None:
+        dlg = TodoEditDialog(self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        item = dlg.build_item()
+        if item is None:
+            QMessageBox.warning(self, "Todo", "内容不能为空。")
+            return
+        self.todos.append(item)
+        self._sync_todos_to_session()
+        self._refresh_todo_list_ui()
+
+    def _todo_row_for_item(self, item: Optional[QListWidgetItem] = None) -> int:
+        if item is not None:
+            return self.todo_list.row(item)
+        return self.todo_list.currentRow()
+
+    def _query_text_for_todo(self, todo: TodoItem) -> str:
+        text = todo.content.strip()
+        if todo.tags:
+            text += "\n（标签：" + ", ".join(todo.tags) + "）"
+        return text
+
+    def on_todo_ask(self, item: Optional[QListWidgetItem] = None) -> None:
+        """将选中 Todo 填入输入框并立即 Send。"""
+        row = self._todo_row_for_item(item)
+        if row < 0 or row >= len(self.todos):
+            return
+        if self.worker and self.worker.isRunning():
+            QMessageBox.information(self, "忙碌", "当前正在等待回复，请稍后再试。")
+            return
+        self.todo_list.setCurrentRow(row)
+        self.input_box.setPlainText(self._query_text_for_todo(self.todos[row]))
+        self.on_ask()
+
+    def _on_todo_context_menu(self, pos) -> None:
+        item = self.todo_list.itemAt(pos)
+        if item is not None:
+            self.todo_list.setCurrentItem(item)
+        row = self.todo_list.currentRow()
+        if row < 0 or row >= len(self.todos):
+            return
+        menu = QMenu(self)
+        ask_action = menu.addAction("提交询问")
+        edit_action = menu.addAction("编辑")
+        edit_action.setShortcut(QKeySequence("F2"))
+        menu.addSeparator()
+        delete_action = menu.addAction("删除")
+        chosen = menu.exec_(self.todo_list.viewport().mapToGlobal(pos))
+        if chosen is ask_action:
+            self.on_todo_ask(item)
+        elif chosen is edit_action:
+            self.on_todo_edit()
+        elif chosen is delete_action:
+            self.on_todo_delete()
+
+    def on_todo_edit(self, *_args: Any) -> None:
+        row = self.todo_list.currentRow()
+        if row < 0 or row >= len(self.todos):
+            QMessageBox.information(self, "Todo", "请先选择一条待办。")
+            return
+        current = self.todos[row]
+        dlg = TodoEditDialog(self, item=current)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        item = dlg.build_item()
+        if item is None:
+            QMessageBox.warning(self, "Todo", "内容不能为空。")
+            return
+        self.todos[row] = item
+        self._sync_todos_to_session()
+        self._refresh_todo_list_ui()
+        self.todo_list.setCurrentRow(row)
+
+    def on_todo_delete(self) -> None:
+        row = self.todo_list.currentRow()
+        if row < 0 or row >= len(self.todos):
+            QMessageBox.information(self, "Todo", "请先选择一条待办。")
+            return
+        self.todos.pop(row)
+        self._sync_todos_to_session()
+        self._refresh_todo_list_ui()
+
+    def on_todo_clear(self) -> None:
+        if not self.todos:
+            return
+        reply = QMessageBox.question(
+            self,
+            "清空 Todo",
+            "确定清空当前会话的全部待办？",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.todos.clear()
+        self._sync_todos_to_session()
+        self._refresh_todo_list_ui()
+
     def _init_sessions(self) -> None:
         self.sessions: List[SessionState] = []
         self._active_session_index: int = -1
@@ -1432,7 +1975,10 @@ class MainWindow(QMainWindow):
 
     def new_session(self) -> None:
         idx = len(self.sessions) + 1
-        state = SessionState(title=f"会话 {idx}", messages=[])
+        tm = self.settings.value("todo_mode_default", False)
+        if isinstance(tm, str):
+            tm = tm.lower() in ("1", "true", "yes")
+        state = SessionState(title=f"会话 {idx}", messages=[], todo_mode=bool(tm))
         self.sessions.append(state)
         self.session_tabs.addTab(QWidget(), state.title)
         self.session_tabs.setCurrentIndex(len(self.sessions) - 1)
@@ -1460,12 +2006,19 @@ class MainWindow(QMainWindow):
         self.sessions[i].messages = list(self.messages)
         self.sessions[i].pending_stream_text = self.pending_stream_text
         self.sessions[i].awaiting_response = self.awaiting_response
+        self.sessions[i].todos = todos_to_json_list(self.todos)
+        self.sessions[i].todo_mode = self._todo_mode_enabled()
 
     def _load_session_state(self, index: int) -> None:
         s = self.sessions[index]
         self.messages = list(s.messages)
         self.pending_stream_text = s.pending_stream_text
         self.awaiting_response = s.awaiting_response
+        self.todos = todos_from_json_list(s.todos)
+        self.todo_mode_checkbox.blockSignals(True)
+        self.todo_mode_checkbox.setChecked(bool(s.todo_mode))
+        self.todo_mode_checkbox.blockSignals(False)
+        self._refresh_todo_list_ui()
 
     def on_session_changed(self, index: int) -> None:
         if index < 0 or index >= len(self.sessions):
@@ -1625,22 +2178,34 @@ class MainWindow(QMainWindow):
         addon = build_skills_system_addon(picked)
         if addon:
             parts.append(addon)
+        if self._todo_mode_enabled():
+            parts.append(todos_system_hint())
         return "\n\n".join(parts)
 
-    def _build_next_request_messages(self, user_input: str) -> List[Dict[str, str]]:
+    def _build_next_request_messages(
+        self,
+        user_input: str,
+        image_urls: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         """与点击 Send 时组装的 messages 一致（不修改 self.messages）。"""
         full_system = self.compose_full_system_prompt(user_input)
         if not self.messages:
-            base: List[Dict[str, str]] = [{"role": "system", "content": full_system}]
+            base: List[Dict[str, Any]] = [{"role": "system", "content": full_system}]
         else:
             base = [dict(m) for m in self.messages]
             if base and base[0].get("role") == "system":
                 base[0] = {**base[0], "content": full_system}
             else:
                 base.insert(0, {"role": "system", "content": full_system})
+        urls = list(image_urls if image_urls is not None else self._pending_image_urls)
         u = user_input.strip()
-        if u:
-            base.append({"role": "user", "content": u})
+        if u or urls:
+            base.append(
+                {
+                    "role": "user",
+                    "content": build_user_message_content(u, urls),
+                }
+            )
         return base
 
     def _next_request_preview_payload(self) -> Dict[str, Any]:
@@ -1682,6 +2247,12 @@ class MainWindow(QMainWindow):
     def _filtered_preview_payload(self) -> Any:
         """按预览区下方开关裁剪 JSON，减少刷屏。"""
         full = self._next_request_preview_payload()
+        if not self.preview_show_images_checkbox.isChecked():
+            full = dict(full)
+            full["messages"] = redact_messages_for_preview(
+                full.get("messages") or [],
+                hide_images=True,
+            )
         show_meta = self.preview_show_meta_checkbox.isChecked()
         show_msgs = self.preview_show_messages_checkbox.isChecked()
         show_tools = self.preview_show_tools_checkbox.isChecked()
@@ -1741,9 +2312,10 @@ class MainWindow(QMainWindow):
 
         preview_enabled = self.preview_checkbox.isChecked()
         user_input = self.input_box.toPlainText().strip()
+        pending_images = list(self._pending_image_urls)
 
-        if preview_enabled and not user_input:
-            QMessageBox.warning(self, "Input required", "Please enter a message.")
+        if preview_enabled and not user_input and not pending_images:
+            QMessageBox.warning(self, "Input required", "请输入文字或附加图片。")
             return
 
         if not self._model_choice_ready():
@@ -1762,11 +2334,16 @@ class MainWindow(QMainWindow):
         model_mode = self.current_model_mode()
         use_tools = self.tools_checkbox.isChecked()
         stream = self.stream_checkbox.isChecked()
+        prov = self.current_provider()
+
+        if pending_images and not provider_supports_vision(prov):
+            QMessageBox.warning(self, "图片不支持", vision_unsupported_hint(prov))
+            return
 
         self.refresh_skills_list()
 
         if preview_enabled:
-            api_messages = self._build_next_request_messages(user_input)
+            api_messages = self._build_next_request_messages(user_input, pending_images)
             self.messages = [dict(m) for m in api_messages]
         else:
             full_system = self.compose_full_system_prompt(user_input)
@@ -1782,8 +2359,18 @@ class MainWindow(QMainWindow):
                 self.messages.insert(0, {"role": "system", "content": full_system})
             api_messages = list(self.messages)
 
+        vision_err = validate_messages_for_provider(api_messages, prov)
+        if vision_err:
+            QMessageBox.warning(self, "图片不支持", vision_err)
+            return
+
         if not api_messages or api_messages[-1].get("role") != "user":
             QMessageBox.warning(self, "Invalid conversation", "Last message to send must be a user message.")
+            return
+
+        last_content = api_messages[-1].get("content")
+        if isinstance(last_content, str) and not last_content.strip() and not pending_images:
+            QMessageBox.warning(self, "Input required", "请输入文字或附加图片。")
             return
 
         self.awaiting_response = True
@@ -1791,6 +2378,7 @@ class MainWindow(QMainWindow):
         self.render_chat()
 
         self.input_box.clear()
+        self._clear_pending_images()
         self.ask_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.update_next_context_preview()
@@ -1827,7 +2415,8 @@ class MainWindow(QMainWindow):
         self.awaiting_response = False
         partial = (self.pending_stream_text or "").strip()
         if partial:
-            self.messages.append({"role": "assistant", "content": partial + "\n\n[已中断]"})
+            content = self._finalize_assistant_answer(partial)
+            self.messages.append({"role": "assistant", "content": content + "\n\n[已中断]"})
         else:
             self.messages.append({"role": "assistant", "content": "[已中断]"})
         self.pending_stream_text = ""
@@ -1835,7 +2424,8 @@ class MainWindow(QMainWindow):
         self.update_next_context_preview()
 
     def on_done(self, full_answer: str):
-        self.messages.append({"role": "assistant", "content": full_answer})
+        content = self._finalize_assistant_answer(full_answer)
+        self.messages.append({"role": "assistant", "content": content})
         self.awaiting_response = False
         self.pending_stream_text = ""
         self.render_chat()
@@ -1870,10 +2460,12 @@ class MainWindow(QMainWindow):
             role = msg.get("role", "")
             if role == "system":
                 continue
-            sections.append(self._bubble_html(role, msg.get("content", "")))
+            sections.append(self._bubble_html(role, msg.get("content")))
 
         if self.awaiting_response:
             typing_text = self.pending_stream_text if self.pending_stream_text else "..."
+            if self._todo_mode_enabled() and typing_text:
+                typing_text, _ = extract_todos_from_reply(typing_text)
             sections.append(self._bubble_html("assistant", typing_text, pending=True))
 
         html_text = "".join([
@@ -1899,7 +2491,8 @@ class MainWindow(QMainWindow):
             # Links
             ".md-content a{color:#2563eb;text-decoration:none;}",
             ".md-content a:hover{text-decoration:underline;}",
-            # Images
+            # Images (chat bubble)
+            ".chat-img{display:block;margin:4px 0 0 0;padding:0;border:0;}",
             ".md-content img{max-width:100%;height:auto;border-radius:6px;margin:0.5em 0;}",
             # Tables
             ".md-content table{border-collapse:collapse;margin:0.5em 0;width:100%;}",
@@ -1913,7 +2506,17 @@ class MainWindow(QMainWindow):
         self.chat_output.setHtml(html_text)
         self.chat_output.moveCursor(QTextCursor.End)
 
-    def _bubble_html(self, role: str, content: str, pending: bool = False) -> str:
+    def _chat_thumbnail_for_display(self, data_url: str) -> Optional[Tuple[str, int, int]]:
+        key = _data_url_cache_key(data_url)
+        cached = self._chat_thumb_cache.get(key)
+        if cached is not None:
+            return cached
+        made = data_url_to_chat_thumbnail(data_url)
+        if made is not None:
+            self._chat_thumb_cache[key] = made
+        return made
+
+    def _bubble_html(self, role: str, content: Any, pending: bool = False) -> str:
         if role == "user":
             label = "You"
             row_align = "right"
@@ -1925,13 +2528,40 @@ class MainWindow(QMainWindow):
             bubble_bg = "#ffffff"
             text_color = "#111827"
 
+        img_urls = image_data_urls_from_content(content) if role == "user" else []
+        display_text = content_to_display_text(content) if not isinstance(content, str) else content
+        # 已有缩略图时不重复显示「[N 张图片]」占位文字
+        if img_urls and display_text:
+            display_text = re.sub(r"\n?\[\d+ 张图片\]\s*$", "", display_text).strip()
+
         # Pending (streaming) text uses plain escaping to avoid partial-Markdown glitches
         if pending:
-            body = html.escape(content).replace("\n", "<br>")
-        elif self.render_md_checkbox.isChecked():
-            body = markdown_to_html(content)
+            body = html.escape(display_text).replace("\n", "<br>") if display_text else ""
+        elif self.render_md_checkbox.isChecked() and isinstance(content, str):
+            body = markdown_to_html(display_text) if display_text else ""
         else:
-            body = html.escape(content).replace("\n", "<br>")
+            body = html.escape(display_text).replace("\n", "<br>") if display_text else ""
+
+        if img_urls:
+            img_parts: List[str] = []
+            for u in img_urls:
+                thumb = self._chat_thumbnail_for_display(u)
+                if thumb is None:
+                    img_parts.append(
+                        "<div style='color:#6b7280;font-size:12px;margin-top:4px;'>[图片]</div>"
+                    )
+                    continue
+                turl, tw, th = thumb
+                img_parts.append(
+                    f"<img class='chat-img' src='{html.escape(turl, quote=True)}' "
+                    f"width='{tw}' height='{th}' "
+                    f"style='width:{tw}px;height:{th}px;' alt='image'/>"
+                )
+            if img_parts:
+                body = (body + "".join(img_parts)) if body else "".join(img_parts)
+
+        if not body:
+            body = "<span style='color:#9ca3af;'>…</span>"
 
         pending_badge = " <span style='color:#6b7280;'>(typing)</span>" if pending else ""
         return (
@@ -1948,6 +2578,8 @@ class MainWindow(QMainWindow):
             "saved_at": datetime.now().isoformat(timespec="seconds"),
             "system_prompt": self.current_system_prompt,
             "messages": self.messages,
+            "todos": todos_to_json_list(self.todos),
+            "todo_mode": self._todo_mode_enabled(),
         }
 
     def _write_payload(self, file_path: Path, payload: dict):
@@ -1981,6 +2613,29 @@ class MainWindow(QMainWindow):
         path = self._next_timestamp_path()
         self._write_payload(path, self._conversation_payload())
 
+    def _normalize_message_content(self, content: Any, index: int) -> Any:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            for pi, part in enumerate(content, start=1):
+                if not isinstance(part, dict):
+                    raise ValueError(f"Message #{index} content part #{pi} must be an object.")
+                ptype = part.get("type")
+                if ptype == "text":
+                    if not isinstance(part.get("text"), str):
+                        raise ValueError(f"Message #{index} text part #{pi} needs string 'text'.")
+                elif ptype == "image_url":
+                    iu = part.get("image_url")
+                    url = iu.get("url") if isinstance(iu, dict) else iu
+                    if not isinstance(url, str) or not url.strip():
+                        raise ValueError(f"Message #{index} image_url part #{pi} needs url.")
+                else:
+                    raise ValueError(
+                        f"Message #{index} content part #{pi} has unsupported type: {ptype}"
+                    )
+            return content
+        raise ValueError(f"Message #{index} content must be a string or array.")
+
     def _parse_preview_messages(self):
         raw = self.preview_context_box.toPlainText().strip()
         if not raw:
@@ -2005,11 +2660,9 @@ class MainWindow(QMainWindow):
             if not isinstance(item, dict):
                 raise ValueError(f"Message #{index} must be an object.")
             role = item.get("role")
-            content = item.get("content")
             if role not in {"system", "user", "assistant"}:
                 raise ValueError(f"Message #{index} has invalid role: {role}")
-            if not isinstance(content, str):
-                raise ValueError(f"Message #{index} content must be a string.")
+            content = self._normalize_message_content(item.get("content"), index)
             cleaned.append({"role": role, "content": content})
         return cleaned
 
@@ -2055,9 +2708,13 @@ class MainWindow(QMainWindow):
         if isinstance(data, dict) and "messages" in data:
             maybe_messages = data.get("messages")
             loaded_prompt = data.get("system_prompt")
+            loaded_todos = data.get("todos")
+            loaded_todo_mode = data.get("todo_mode")
         elif isinstance(data, list):
             maybe_messages = data
             loaded_prompt = None
+            loaded_todos = None
+            loaded_todo_mode = None
         else:
             QMessageBox.warning(self, "Invalid file", "JSON must be a payload object or message list.")
             return
@@ -2070,11 +2727,9 @@ class MainWindow(QMainWindow):
                 if not isinstance(item, dict):
                     raise ValueError(f"Message #{index} must be an object")
                 role = item.get("role")
-                content = item.get("content")
                 if role not in {"system", "user", "assistant"}:
                     raise ValueError(f"Message #{index} has invalid role: {role}")
-                if not isinstance(content, str):
-                    raise ValueError(f"Message #{index} content must be a string")
+                content = self._normalize_message_content(item.get("content"), index)
                 cleaned.append({"role": role, "content": content})
         except ValueError as exc:
             QMessageBox.warning(self, "Invalid conversation", str(exc))
@@ -2086,10 +2741,25 @@ class MainWindow(QMainWindow):
         else:
             for msg in self.messages:
                 if msg.get("role") == "system":
-                    self.current_system_prompt = msg.get("content", self.current_system_prompt)
+                    sp = msg.get("content", self.current_system_prompt)
+                    self.current_system_prompt = (
+                        sp if isinstance(sp, str) else content_to_display_text(sp)
+                    )
                     break
 
         self.current_prompt_display.setPlainText(self.current_system_prompt)
+        if loaded_todos is not None:
+            self.todos = todos_from_json_list(loaded_todos)
+        else:
+            self.todos = []
+        if loaded_todo_mode is not None:
+            self.todo_mode_checkbox.blockSignals(True)
+            self.todo_mode_checkbox.setChecked(bool(loaded_todo_mode))
+            self.todo_mode_checkbox.blockSignals(False)
+        if 0 <= self._active_session_index < len(self.sessions):
+            self.sessions[self._active_session_index].todos = todos_to_json_list(self.todos)
+            self.sessions[self._active_session_index].todo_mode = self._todo_mode_enabled()
+        self._refresh_todo_list_ui()
         self.pending_stream_text = ""
         self.awaiting_response = False
         self.render_chat()
