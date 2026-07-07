@@ -6,13 +6,20 @@ import select
 import socket
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 # 流式 SSE：短轮询便于 Stop；总等待时长由 opener.open(timeout=…) 控制，思考模型需足够大
 STREAM_READ_POLL_SEC = 1.0
 STREAM_TIMEOUT_DEFAULT = 180
 STREAM_TIMEOUT_OLLAMA = 3600
+STREAM_TIMEOUT_LOCAL = STREAM_TIMEOUT_OLLAMA  # Ollama / LM Studio 等本地推理
 STREAM_TIMEOUT_UNLIMITED = -1
+
+# 工具循环：每轮 = 一次带 tools 的 API 请求（可能含多次 tool_call）
+TOOL_MAX_ROUNDS_DEFAULT = 64
+TOOL_MAX_ROUNDS_MIN = 8
+TOOL_MAX_ROUNDS_MAX = 200
 
 API_URL = "https://api.deepseek.com/chat/completions"
 MODEL_ALIASES: Dict[str, str] = {
@@ -60,6 +67,7 @@ KIMI_MODEL_ALIASES: Dict[str, str] = {
 PROVIDER_DEEPSEEK = "deepseek"
 PROVIDER_KIMI = "kimi"
 PROVIDER_OLLAMA = "ollama"
+PROVIDER_LMSTUDIO = "lmstudio"
 
 # 多模态：单次 user 消息最多图片数；单张原始字节上限（base64 后更大）
 VISION_MAX_IMAGES = 4
@@ -91,6 +99,37 @@ def ollama_chat_completions_url(ui_override: Optional[str] = None) -> str:
     return f"{ollama_api_base(ui_override)}/v1/chat/completions"
 
 
+# 本地 LM Studio OpenAI 兼容端点（默认端口 1234）
+# GET /v1/models；POST /v1/chat/completions
+# 环境变量 LMSTUDIO_API_BASE / LM_STUDIO_API_BASE / LMSTUDIO_HOST；可选 LMSTUDIO_API_KEY
+LMSTUDIO_API_BASE_DEFAULT = "http://127.0.0.1:1234"
+
+
+def lmstudio_api_base(ui_override: Optional[str] = None) -> str:
+    """解析 LM Studio HTTP 根地址（不含路径）。"""
+    u = (ui_override or "").strip().rstrip("/")
+    if u:
+        return u
+    for env in ("LMSTUDIO_API_BASE", "LM_STUDIO_API_BASE", "LMSTUDIO_HOST"):
+        v = os.getenv(env, "").strip().rstrip("/")
+        if v:
+            return v
+    return LMSTUDIO_API_BASE_DEFAULT
+
+
+def lmstudio_chat_completions_url(ui_override: Optional[str] = None) -> str:
+    return f"{lmstudio_api_base(ui_override)}/v1/chat/completions"
+
+
+def lmstudio_models_list_url(ui_override: Optional[str] = None) -> str:
+    return f"{lmstudio_api_base(ui_override)}/v1/models"
+
+
+def get_lmstudio_key() -> str:
+    """LM Studio 本地服务通常无需密钥；若在应用内配置了 API Key 则使用。"""
+    return os.getenv("LMSTUDIO_API_KEY", "").strip()
+
+
 class StreamInterrupted(Exception):
     """Raised when stream is interrupted by user."""
 
@@ -113,13 +152,16 @@ def resolve_chat_endpoint(
     provider: str,
     *,
     ollama_ui_base: Optional[str] = None,
+    lmstudio_ui_base: Optional[str] = None,
 ) -> Tuple[str, str]:
-    """按提供方返回 (api_key, chat_completions_url)。Ollama 本地无需密钥，返回空字符串。"""
+    """按提供方返回 (api_key, chat_completions_url)。Ollama / LM Studio 本地通常无需密钥。"""
     p = (provider or PROVIDER_DEEPSEEK).strip().lower()
     if p == PROVIDER_KIMI:
         return get_kimi_key(), kimi_chat_completions_url()
     if p == PROVIDER_OLLAMA:
         return "", ollama_chat_completions_url(ollama_ui_base)
+    if p == PROVIDER_LMSTUDIO:
+        return get_lmstudio_key(), lmstudio_chat_completions_url(lmstudio_ui_base)
     return get_api_key(), API_URL
 
 
@@ -128,7 +170,7 @@ def resolve_model(model_mode: str, provider: str = PROVIDER_DEEPSEEK) -> str:
     p = (provider or PROVIDER_DEEPSEEK).strip().lower()
     if p == PROVIDER_KIMI:
         return KIMI_MODEL_ALIASES.get(key, model_mode)
-    if p == PROVIDER_OLLAMA:
+    if p in (PROVIDER_OLLAMA, PROVIDER_LMSTUDIO):
         return model_mode.strip()
     return MODEL_ALIASES.get(key, model_mode)
 
@@ -208,6 +250,50 @@ def _parse_openai_models_list(payload: Dict[str, Any]) -> List[str]:
     return sorted(set(out))
 
 
+def _is_loopback_http_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host in ("localhost", "127.0.0.1", "::1")
+
+
+def _effective_proxy_for_url(url: str, proxy_url: Optional[str]) -> Optional[str]:
+    """访问本机 LM Studio / Ollama 时不走 HTTP 代理，避免 127.0.0.1 被代理劫持。"""
+    if proxy_url and _is_loopback_http_url(url):
+        return None
+    return proxy_url
+
+
+def _parse_lmstudio_models_list(payload: Dict[str, Any]) -> List[str]:
+    """兼容 OpenAI ``data[].id`` 与 LM Studio 0.4 原生 ``models[].key``。"""
+    out: List[str] = []
+    out.extend(_parse_openai_models_list(payload))
+    for bucket_key in ("models", "data"):
+        items = payload.get(bucket_key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            for field in ("key", "id", "model_key"):
+                val = item.get(field)
+                if isinstance(val, str) and val.strip():
+                    out.append(val.strip())
+                    break
+    return sorted(set(out))
+
+
+def _lmstudio_fetch_json(
+    url: str,
+    *,
+    timeout: int,
+    proxy_url: Optional[str],
+) -> Dict[str, Any]:
+    key = get_lmstudio_key()
+    proxy = _effective_proxy_for_url(url, proxy_url)
+    if key:
+        return _get_json_with_proxy(url, key, timeout, proxy)
+    return _get_json_simple(url, timeout, proxy)
+
+
 def _try_list_models_urls(
     urls: Tuple[str, ...],
     api_key: str,
@@ -270,6 +356,36 @@ def list_ollama_models(
     return []
 
 
+def list_lmstudio_models(
+    *,
+    base_url: str,
+    timeout: int = 15,
+    proxy_url: Optional[str] = None,
+) -> List[str]:
+    """
+    扫描本地 LM Studio：依次尝试 OpenAI 兼容 ``/v1/models`` 与原生 ``/api/v1/models``。
+    需先在 LM Studio Developer 页启动 Local Server。
+    """
+    base = base_url.rstrip("/")
+    urls = (
+        f"{base}/v1/models",
+        f"{base}/api/v1/models",
+    )
+    last_exc: Optional[BaseException] = None
+    for url in urls:
+        try:
+            payload = _lmstudio_fetch_json(url, timeout=timeout, proxy_url=proxy_url)
+            ids = _parse_lmstudio_models_list(payload)
+            if ids:
+                return ids
+        except BaseException as exc:
+            last_exc = exc
+            continue
+    if last_exc is not None:
+        raise last_exc
+    return []
+
+
 def check_available(
     *,
     proxy_url: Optional[str] = None,
@@ -277,9 +393,10 @@ def check_available(
     ds_key: Optional[str] = None,
     kimi_key: Optional[str] = None,
     ollama_ui_base: Optional[str] = None,
+    lmstudio_ui_base: Optional[str] = None,
 ) -> Tuple[List[Tuple[str, str]], List[str]]:
     """
-    通过 HTTP 拉取 DeepSeek、Kimi 可用模型及本地 Ollama 已安装模型。
+    通过 HTTP 拉取 DeepSeek、Kimi、本地 Ollama / LM Studio 可用模型。
     返回 ( [(provider, model_id), ...], [警告/跳过说明] )。
     """
     combined: List[Tuple[str, str]] = []
@@ -323,6 +440,23 @@ def check_available(
         notes.append(f"Ollama（{base_ollama}）: {exc}")
     except Exception as exc:
         notes.append(f"Ollama（{base_ollama}）: {exc}")
+
+    base_lmstudio = lmstudio_api_base(lmstudio_ui_base)
+    try:
+        for mid in list_lmstudio_models(
+            base_url=base_lmstudio,
+            timeout=min(timeout, 25),
+            proxy_url=proxy_url,
+        ):
+            combined.append((PROVIDER_LMSTUDIO, mid))
+    except urllib.error.URLError as exc:
+        notes.append(
+            f"LM Studio（{base_lmstudio}）: {exc} — 请在 LM Studio → Developer 打开 Start server"
+        )
+    except Exception as exc:
+        notes.append(
+            f"LM Studio（{base_lmstudio}）: {exc} — 请确认 Local Server 已启动且地址为 {base_lmstudio}"
+        )
 
     combined.sort(key=lambda x: (x[0], x[1]))
     return combined, notes
@@ -385,7 +519,7 @@ def _post_json_with_proxy(
         headers=_request_headers(api_key),
         method="POST",
     )
-    opener = _build_opener(proxy_url)
+    opener = _build_opener(_effective_proxy_for_url(api_url, proxy_url))
     return opener.open(request, timeout=timeout)
 
 
@@ -403,8 +537,8 @@ def effective_stream_timeout(
         return None
     base = timeout if timeout is not None and timeout > 0 else STREAM_TIMEOUT_DEFAULT
     p = (provider or PROVIDER_DEEPSEEK).strip().lower()
-    if p == PROVIDER_OLLAMA:
-        return max(base, STREAM_TIMEOUT_OLLAMA)
+    if p in (PROVIDER_OLLAMA, PROVIDER_LMSTUDIO):
+        return max(base, STREAM_TIMEOUT_LOCAL)
     return base
 
 
@@ -632,10 +766,10 @@ def provider_supports_vision(provider: str) -> bool:
 
     DeepSeek 官方 Chat Completions（deepseek-v4-*）截至文档仍仅接受纯文本 content；
     发送 image_url 会返回 400（unknown variant image_url, expected text）。
-    Kimi（Moonshot）与本地 Ollama 视觉模型支持 OpenAI 风格 content 数组。
+    Kimi（Moonshot）与本地 Ollama / LM Studio 视觉模型支持 OpenAI 风格 content 数组。
     """
     p = (provider or PROVIDER_DEEPSEEK).strip().lower()
-    return p in (PROVIDER_KIMI, PROVIDER_OLLAMA)
+    return p in (PROVIDER_KIMI, PROVIDER_OLLAMA, PROVIDER_LMSTUDIO)
 
 
 def vision_unsupported_hint(provider: str) -> str:
@@ -644,7 +778,7 @@ def vision_unsupported_hint(provider: str) -> str:
         return (
             "DeepSeek 官方 API（deepseek-v4-flash / deepseek-v4-pro）目前不支持图片输入；"
             "网页版 chat 有视觉能力但 API 尚未开放。"
-            "请切换到 Kimi 视觉模型或本地 Ollama 多模态模型。"
+            "请切换到 Kimi 视觉模型或本地 Ollama / LM Studio 多模态模型。"
         )
     return f"提供方 {p} 未标记为支持视觉输入。"
 
@@ -1008,6 +1142,16 @@ def chat_completion_message_stream(
     return msg
 
 
+def resolve_tool_max_rounds(ui_override: Optional[int] = None) -> int:
+    """解析工具 API 往返轮数上限。ui_override 优先，其次环境变量 DEEPSEEK_TOOL_MAX_ROUNDS。"""
+    if ui_override is not None and ui_override > 0:
+        return max(TOOL_MAX_ROUNDS_MIN, min(TOOL_MAX_ROUNDS_MAX, int(ui_override)))
+    raw = os.getenv("DEEPSEEK_TOOL_MAX_ROUNDS", "").strip()
+    if raw.isdigit():
+        return max(TOOL_MAX_ROUNDS_MIN, min(TOOL_MAX_ROUNDS_MAX, int(raw)))
+    return TOOL_MAX_ROUNDS_DEFAULT
+
+
 def run_chat_with_tools(
     api_key: str,
     messages: List[Dict[str, Any]],
@@ -1017,7 +1161,7 @@ def run_chat_with_tools(
     *,
     temperature: float = 0.7,
     timeout: int = 180,
-    max_rounds: int = 24,
+    max_rounds: Optional[int] = None,
     should_stop: Optional[Callable[[], bool]] = None,
     on_tool_round: Optional[Callable[[str, str, str], None]] = None,
     proxy_url: Optional[str] = None,
@@ -1036,8 +1180,9 @@ def run_chat_with_tools(
     msgs: List[Dict[str, Any]] = [dict(m) for m in messages]
     trace_lines: List[str] = []
     use_stream = bool(stream_tokens and on_stream_token)
+    round_limit = resolve_tool_max_rounds(max_rounds)
 
-    for _ in range(max_rounds):
+    for _ in range(round_limit):
         if should_stop and should_stop():
             raise StreamInterrupted("Stream interrupted by user")
 
@@ -1117,4 +1262,12 @@ def run_chat_with_tools(
             final = "\n".join(trace_lines) + "\n\n---\n\n" + final
         return msgs, final
 
-    raise RuntimeError(f"工具调用超过最大轮数 limit={max_rounds}")
+    err_note = (
+        f"[工具调用已达上限 limit={round_limit}]。上文 tool 检索结果已写入对话上下文，"
+        "你可直接继续追问，让模型基于已有结果作答；或缩小问题、关闭部分工具后重试。"
+    )
+    body = err_note
+    if trace_lines:
+        body = "\n".join(trace_lines) + "\n\n---\n\n" + err_note
+    msgs.append({"role": "assistant", "content": body})
+    return msgs, body

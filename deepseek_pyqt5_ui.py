@@ -48,8 +48,12 @@ from deepseek_api import (
     PROVIDER_DEEPSEEK,
     PROVIDER_KIMI,
     PROVIDER_OLLAMA,
+    PROVIDER_LMSTUDIO,
     STREAM_TIMEOUT_DEFAULT,
     STREAM_TIMEOUT_UNLIMITED,
+    TOOL_MAX_ROUNDS_DEFAULT,
+    TOOL_MAX_ROUNDS_MAX,
+    TOOL_MAX_ROUNDS_MIN,
     VISION_MAX_IMAGE_BYTES,
     VISION_MAX_IMAGES,
     build_user_message_content,
@@ -97,6 +101,7 @@ from workspace_tools import WorkspaceToolSession, openai_tool_specs
 from todo_model import (
     TodoItem,
     extract_todos_from_reply,
+    todos_execute_hint,
     todos_from_json_list,
     todos_system_hint,
     todos_to_json_list,
@@ -230,6 +235,7 @@ class AskWorker(QThread):
         provider: str = PROVIDER_DEEPSEEK,
         temperature: float = 0.7,
         timeout: int = STREAM_TIMEOUT_DEFAULT,
+        tool_max_rounds: Optional[int] = None,
     ):
         super().__init__()
         self.api_key = api_key
@@ -246,6 +252,7 @@ class AskWorker(QThread):
         self.provider = provider
         self.temperature = temperature
         self.timeout = timeout
+        self.tool_max_rounds = tool_max_rounds
         self._should_stop = False
 
     def stop(self):
@@ -266,8 +273,9 @@ class AskWorker(QThread):
                 proxy_url=self.proxy_url,
                 api_url=self.api_url,
                 provider=self.provider,
+                tool_max_rounds=self.tool_max_rounds,
             )
-            answer = run_harness(
+            result = run_harness(
                 api_key=self.api_key,
                 messages=self.messages,
                 model_mode=self.model_mode,
@@ -277,7 +285,15 @@ class AskWorker(QThread):
                 should_stop=self.should_stop,
                 on_stream_token=self.chunk.emit if self.stream else None,
             )
-            self.done.emit(answer)
+            if result.messages is not None:
+                self.done.emit(
+                    json.dumps(
+                        {"answer": result.answer, "messages": result.messages},
+                        ensure_ascii=False,
+                    )
+                )
+            else:
+                self.done.emit(result.answer)
         except StreamInterrupted:
             self.interrupted.emit()
         except urllib.error.HTTPError as exc:
@@ -731,11 +747,13 @@ class ModelsRefreshWorker(QThread):
         proxy_url: Optional[str] = None,
         timeout: int = 45,
         ollama_ui_base: Optional[str] = None,
+        lmstudio_ui_base: Optional[str] = None,
     ):
         super().__init__()
         self.proxy_url = proxy_url
         self.timeout = timeout
         self.ollama_ui_base = ollama_ui_base
+        self.lmstudio_ui_base = lmstudio_ui_base
 
     def run(self) -> None:
         try:
@@ -743,6 +761,7 @@ class ModelsRefreshWorker(QThread):
                 proxy_url=self.proxy_url,
                 timeout=self.timeout,
                 ollama_ui_base=self.ollama_ui_base,
+                lmstudio_ui_base=self.lmstudio_ui_base,
             )
             self.done.emit(entries, notes)
         except Exception as exc:
@@ -764,6 +783,7 @@ class MainWindow(QMainWindow):
         self.messages = []
         self.todos: List[TodoItem] = []
         self._todo_list_refreshing = False
+        self._submitting_todo_execute = False
         self.current_system_prompt = "You are a helpful assistant."
         self.pending_stream_text = ""
         self.awaiting_response = False
@@ -959,14 +979,15 @@ class MainWindow(QMainWindow):
         row_model.addWidget(QLabel("Model"))
         self.model_combo = QComboBox()
         self.model_combo.setToolTip(
-            "来自 DeepSeek / Kimi GET /v1/models 与本地 Ollama（/api/tags）；标注 [DS]/[Kimi]/[Ollama]。"
-            "Kimi 需 KIMI_KEY；DeepSeek 需 DS_KEY；Ollama 无需密钥（默认 http://127.0.0.1:11434，可用下方地址或环境变量"
-            " OLLAMA_HOST / OLLAMA_API_BASE 覆盖）。点击「刷新模型」合并列表。"
-            "图片输入：Kimi 视觉模型与 Ollama 多模态模型支持；DeepSeek 官方 API 暂不支持。"
+            "来自 DeepSeek / Kimi GET /v1/models、本地 Ollama（/api/tags）与 LM Studio（/v1/models）；"
+            "标注 [DS]/[Kimi]/[Ollama]/[LM Studio]。"
+            "Kimi 需 KIMI_KEY；DeepSeek 需 DS_KEY；Ollama / LM Studio 无需密钥（默认本机端口，可用下方地址或环境变量覆盖）。"
+            "点击「刷新模型」合并列表。"
+            "图片输入：Kimi 视觉模型与 Ollama / LM Studio 多模态模型支持；DeepSeek 官方 API 暂不支持。"
         )
         self.refresh_models_btn = QPushButton("刷新模型")
         self.refresh_models_btn.setToolTip(
-            "合并 DeepSeek、Kimi 的 GET /v1/models 与 Ollama 的已安装模型；尊重「代理」开关（访问本机 Ollama 时可关闭代理）。"
+            "合并 DeepSeek、Kimi、Ollama 与 LM Studio 模型；访问本机服务时建议关闭代理。"
         )
         row_model.addWidget(self.model_combo, 1)
         row_model.addWidget(self.refresh_models_btn)
@@ -1049,6 +1070,25 @@ class MainWindow(QMainWindow):
         row_ollama.addWidget(self.ollama_base_edit, 1)
         model_layout.addLayout(row_ollama)
 
+        row_lmstudio = QHBoxLayout()
+        row_lmstudio.addWidget(QLabel("LM Studio 地址"))
+        self.lmstudio_base_edit = QLineEdit()
+        self.lmstudio_base_edit.setPlaceholderText(
+            "留空 → LMSTUDIO_API_BASE / 默认 http://127.0.0.1:1234"
+        )
+        ls_saved = self.settings.value("lmstudio_api_base", "")
+        self.lmstudio_base_edit.setText(str(ls_saved) if ls_saved is not None else "")
+        self.lmstudio_base_edit.setToolTip(
+            "LM Studio 本地服务（默认 http://127.0.0.1:1234）。"
+            "须先在 LM Studio → Developer 打开 Start server，再点「刷新模型」。"
+            "访问本机时建议关闭代理。可选环境变量 LMSTUDIO_API_KEY。"
+        )
+        self.lmstudio_base_edit.textChanged.connect(
+            lambda t: self.settings.setValue("lmstudio_api_base", t)
+        )
+        row_lmstudio.addWidget(self.lmstudio_base_edit, 1)
+        model_layout.addLayout(row_lmstudio)
+
         self.prompt_button = QPushButton("System Prompts…")
         self.prompt_button.clicked.connect(self.on_open_prompt_dialog)
         model_layout.addWidget(self.prompt_button)
@@ -1089,8 +1129,32 @@ class MainWindow(QMainWindow):
         self.tools_checkbox = QCheckBox("启用本地工具（文件读写/搜索）")
         self.tools_checkbox.setToolTip(
             "启用后模型可多轮调用工具：读写/搜索文件，并可选择在工作区内执行子进程命令（自动关闭流式输出）。"
+            "工具轮数上限见下方；也可用环境变量 DEEPSEEK_TOOL_MAX_ROUNDS 覆盖默认值。"
         )
         model_layout.addWidget(self.tools_checkbox)
+
+        row_tool_rounds = QHBoxLayout()
+        row_tool_rounds.addWidget(QLabel("工具轮数上限"))
+        self.tool_max_rounds_spin = QSpinBox()
+        self.tool_max_rounds_spin.setRange(TOOL_MAX_ROUNDS_MIN, TOOL_MAX_ROUNDS_MAX)
+        tmr_saved = self.settings.value("tool_max_rounds", TOOL_MAX_ROUNDS_DEFAULT)
+        try:
+            tmr_i = int(tmr_saved)
+        except (TypeError, ValueError):
+            tmr_i = TOOL_MAX_ROUNDS_DEFAULT
+        self.tool_max_rounds_spin.setValue(
+            max(TOOL_MAX_ROUNDS_MIN, min(TOOL_MAX_ROUNDS_MAX, tmr_i))
+        )
+        self.tool_max_rounds_spin.setToolTip(
+            "单次提问中模型↔工具 API 往返次数上限（默认 64）。"
+            "达到上限时保留迄今 tool 上下文并提示继续追问，不再抛错清空。"
+        )
+        self.tool_max_rounds_spin.valueChanged.connect(
+            lambda v: self.settings.setValue("tool_max_rounds", int(v))
+        )
+        row_tool_rounds.addWidget(self.tool_max_rounds_spin)
+        row_tool_rounds.addStretch(1)
+        model_layout.addLayout(row_tool_rounds)
 
         self.allow_commands_checkbox = QCheckBox("允许执行命令（run_command）")
         self.allow_commands_checkbox.setToolTip(
@@ -1193,8 +1257,8 @@ class MainWindow(QMainWindow):
         todo_top = QHBoxLayout()
         self.todo_mode_checkbox = QCheckBox("Todo 模式")
         self.todo_mode_checkbox.setToolTip(
-            "启用后：system prompt 注入 Todo 输出约定；每次助手回复末尾的 ```todos``` 块"
-            "会被解析为 2 条待办并追加到下列列表（列表中不显示该代码块）。"
+            "启用后：system prompt 注入 Todo 输出约定；助手回复末尾的 ```todos``` 块"
+            "会被解析并追加到列表（默认每轮 2 条；用户可要求 N 条）。正文中不显示该代码块。"
         )
         tm_default = self.settings.value("todo_mode_default", False)
         if isinstance(tm_default, str):
@@ -1214,7 +1278,7 @@ class MainWindow(QMainWindow):
         todo_layout.addLayout(todo_top)
 
         todo_layout.addWidget(
-            QLabel("拖动调整优先级；双击条目直接提交询问；F2 或右键编辑。")
+            QLabel("拖动调整优先级；双击提交询问；F2/右键编辑；Delete 删除。")
         )
         self.todo_list = QListWidget()
         self.todo_list.setDragDropMode(QAbstractItemView.InternalMove)
@@ -1232,6 +1296,8 @@ class MainWindow(QMainWindow):
         self.todo_list.customContextMenuRequested.connect(self._on_todo_context_menu)
         self.todo_list.model().rowsMoved.connect(self._on_todos_reordered)
         QShortcut(QKeySequence("F2"), self.todo_list, activated=self.on_todo_edit)
+        QShortcut(QKeySequence.Delete, self.todo_list, activated=self.on_todo_delete)
+        QShortcut(QKeySequence.Backspace, self.todo_list, activated=self.on_todo_delete)
 
         # 须在创建 skills_list 之后再连接（初始化早期会调用 _on_tools_toggled，不能在其中刷新预览）
         self.tools_checkbox.toggled.connect(self.update_next_context_preview)
@@ -1481,6 +1547,8 @@ class MainWindow(QMainWindow):
                 tag = "Kimi"
             elif prov == PROVIDER_OLLAMA:
                 tag = "Ollama"
+            elif prov == PROVIDER_LMSTUDIO:
+                tag = "LM Studio"
             else:
                 tag = str(prov)[:8]
             self.model_combo.addItem(f"[{tag}] {mid}", (prov, mid))
@@ -1532,10 +1600,12 @@ class MainWindow(QMainWindow):
         self.refresh_models_btn.setEnabled(False)
         self.statusBar().showMessage("正在拉取可用模型…")
         ollama_ui = self.ollama_base_edit.text().strip() or None
+        lmstudio_ui = self.lmstudio_base_edit.text().strip() or None
         self._models_refresh_worker = ModelsRefreshWorker(
             proxy_url=proxy,
             timeout=60,
             ollama_ui_base=ollama_ui,
+            lmstudio_ui_base=lmstudio_ui,
         )
         self._models_refresh_worker.done.connect(self._on_models_refresh_done)
         self._models_refresh_worker.failed.connect(self._on_models_refresh_failed)
@@ -1633,10 +1703,16 @@ class MainWindow(QMainWindow):
             return "Kimi"
         if p == PROVIDER_OLLAMA:
             return "Ollama"
+        if p == PROVIDER_LMSTUDIO:
+            return "LM Studio"
         return "DeepSeek"
 
     def _ollama_ui_base_for_api(self) -> Optional[str]:
         t = self.ollama_base_edit.text().strip()
+        return t if t else None
+
+    def _lmstudio_ui_base_for_api(self) -> Optional[str]:
+        t = self.lmstudio_base_edit.text().strip()
         return t if t else None
 
     def _ui_temperature(self) -> float:
@@ -1810,6 +1886,38 @@ class MainWindow(QMainWindow):
     def _on_tools_toggled(self, on: bool) -> None:
         self.allow_commands_checkbox.setEnabled(on)
         self.web_search_checkbox.setEnabled(on)
+        self.tool_max_rounds_spin.setEnabled(on)
+
+    def _apply_todo_finalize_to_messages(
+        self, msgs: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        out = [dict(m) for m in msgs]
+        if not self._todo_mode_enabled():
+            return out
+        for i in range(len(out) - 1, -1, -1):
+            m = out[i]
+            if m.get("role") != "assistant":
+                continue
+            c = m.get("content")
+            if isinstance(c, str) and c.strip():
+                out[i] = {**m, "content": self._finalize_assistant_answer(c)}
+            break
+        return out
+
+    def _parse_harness_done_payload(self, payload: str) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
+        text = payload or ""
+        if not text.strip().startswith("{"):
+            return text, None
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return text, None
+        if not isinstance(data, dict) or "messages" not in data:
+            return text, None
+        msgs = data.get("messages")
+        if not isinstance(msgs, list):
+            return str(data.get("answer") or text), None
+        return str(data.get("answer") or ""), msgs
 
     def _todo_mode_enabled(self) -> bool:
         return self.todo_mode_checkbox.isChecked()
@@ -1862,10 +1970,16 @@ class MainWindow(QMainWindow):
     def _finalize_assistant_answer(self, raw: str) -> str:
         if not self._todo_mode_enabled():
             return raw
+        if self._submitting_todo_execute:
+            display, _ = extract_todos_from_reply(raw)
+            return display
         display, new_items = extract_todos_from_reply(raw)
         if new_items:
             self._append_todos(new_items)
         return display
+
+    def _clear_todo_execute_submit_flag(self) -> None:
+        self._submitting_todo_execute = False
 
     def on_todo_add(self) -> None:
         dlg = TodoEditDialog(self)
@@ -1885,10 +1999,14 @@ class MainWindow(QMainWindow):
         return self.todo_list.currentRow()
 
     def _query_text_for_todo(self, todo: TodoItem) -> str:
-        text = todo.content.strip()
+        lines = [
+            "请优先完成或解答以下待办（直接给实质帮助，不要转而规划新待办）：",
+            "",
+            todo.content.strip(),
+        ]
         if todo.tags:
-            text += "\n（标签：" + ", ".join(todo.tags) + "）"
-        return text
+            lines.extend(["", "标签：" + ", ".join(todo.tags)])
+        return "\n".join(lines)
 
     def on_todo_ask(self, item: Optional[QListWidgetItem] = None) -> None:
         """将选中 Todo 填入输入框并立即 Send。"""
@@ -1899,6 +2017,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "忙碌", "当前正在等待回复，请稍后再试。")
             return
         self.todo_list.setCurrentRow(row)
+        self._submitting_todo_execute = True
         self.input_box.setPlainText(self._query_text_for_todo(self.todos[row]))
         self.on_ask()
 
@@ -2111,6 +2230,7 @@ class MainWindow(QMainWindow):
             api_key, api_url = resolve_chat_endpoint(
                 self.current_provider(),
                 ollama_ui_base=self._ollama_ui_base_for_api(),
+                lmstudio_ui_base=self._lmstudio_ui_base_for_api(),
             )
         except ValueError as exc:
             QMessageBox.critical(self, "API Key", str(exc))
@@ -2179,7 +2299,10 @@ class MainWindow(QMainWindow):
         if addon:
             parts.append(addon)
         if self._todo_mode_enabled():
-            parts.append(todos_system_hint())
+            if self._submitting_todo_execute:
+                parts.append(todos_execute_hint())
+            else:
+                parts.append(todos_system_hint())
         return "\n\n".join(parts)
 
     def _build_next_request_messages(
@@ -2326,6 +2449,7 @@ class MainWindow(QMainWindow):
             api_key, api_url = resolve_chat_endpoint(
                 self.current_provider(),
                 ollama_ui_base=self._ollama_ui_base_for_api(),
+                lmstudio_ui_base=self._lmstudio_ui_base_for_api(),
             )
         except ValueError as exc:
             QMessageBox.critical(self, "API Key", str(exc))
@@ -2398,6 +2522,7 @@ class MainWindow(QMainWindow):
             provider=self.current_provider(),
             temperature=self._ui_temperature(),
             timeout=self._ui_request_timeout(),
+            tool_max_rounds=int(self.tool_max_rounds_spin.value()),
         )
         self.worker.chunk.connect(self.on_chunk)
         self.worker.done.connect(self.on_done)
@@ -2420,14 +2545,20 @@ class MainWindow(QMainWindow):
         else:
             self.messages.append({"role": "assistant", "content": "[已中断]"})
         self.pending_stream_text = ""
+        self._clear_todo_execute_submit_flag()
         self.render_chat()
         self.update_next_context_preview()
 
     def on_done(self, full_answer: str):
-        content = self._finalize_assistant_answer(full_answer)
-        self.messages.append({"role": "assistant", "content": content})
+        answer, api_messages = self._parse_harness_done_payload(full_answer)
         self.awaiting_response = False
         self.pending_stream_text = ""
+        self._clear_todo_execute_submit_flag()
+        if api_messages is not None:
+            self.messages = self._apply_todo_finalize_to_messages(api_messages)
+        else:
+            content = self._finalize_assistant_answer(answer)
+            self.messages.append({"role": "assistant", "content": content})
         self.render_chat()
         self.update_next_context_preview()
 
@@ -2435,12 +2566,14 @@ class MainWindow(QMainWindow):
         self.messages.append({"role": "assistant", "content": f"[Error] {message}"})
         self.awaiting_response = False
         self.pending_stream_text = ""
+        self._clear_todo_execute_submit_flag()
         self.render_chat()
         self.update_next_context_preview()
 
     def on_worker_finished(self):
         self.ask_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+        self._clear_todo_execute_submit_flag()
 
     def update_next_context_preview(self):
         if not self.preview_checkbox.isChecked():
@@ -2458,8 +2591,12 @@ class MainWindow(QMainWindow):
         sections = []
         for msg in self.messages:
             role = msg.get("role", "")
-            if role == "system":
+            if role in ("system", "tool"):
                 continue
+            if role == "assistant" and msg.get("tool_calls"):
+                c = msg.get("content")
+                if not (isinstance(c, str) and c.strip()):
+                    continue
             sections.append(self._bubble_html(role, msg.get("content")))
 
         if self.awaiting_response:
@@ -2811,6 +2948,7 @@ class MainWindow(QMainWindow):
             api_key, api_url = resolve_chat_endpoint(
                 self.current_provider(),
                 ollama_ui_base=self._ollama_ui_base_for_api(),
+                lmstudio_ui_base=self._lmstudio_ui_base_for_api(),
             )
         except ValueError as exc:
             QMessageBox.critical(self, "API Key", str(exc))

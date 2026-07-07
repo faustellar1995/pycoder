@@ -58,6 +58,15 @@ class HarnessConfig:
     proxy_url: Optional[str] = None
     api_url: str = API_URL
     provider: str = PROVIDER_DEEPSEEK
+    tool_max_rounds: Optional[int] = None
+
+
+@dataclass
+class HarnessResult:
+    """run_harness 返回值。工具模式下 messages 含完整 assistant/tool 往返，供 UI 写回上下文。"""
+
+    answer: str
+    messages: Optional[List[Dict[str, Any]]] = None
 
 
 def run_harness(
@@ -70,7 +79,7 @@ def run_harness(
     timeout: int = 180,
     should_stop: Optional[Callable[[], bool]] = None,
     on_stream_token: Optional[Callable[[str], None]] = None,
-) -> str:
+) -> HarnessResult:
     """执行一次“发问→得到回答”，按 config 决定是否走工具循环/流式。"""
     vision_err = validate_messages_for_provider(messages, config.provider)
     if vision_err:
@@ -86,7 +95,7 @@ def run_harness(
         def _exec(name: str, args: str) -> str:
             return session.execute(name, args)
 
-        _msgs, answer = run_chat_with_tools(
+        msgs_out, answer = run_chat_with_tools(
             api_key,
             messages,
             model_mode,
@@ -94,6 +103,7 @@ def run_harness(
             _exec,
             temperature=temperature,
             timeout=timeout,
+            max_rounds=config.tool_max_rounds,
             should_stop=should_stop,
             proxy_url=config.proxy_url,
             api_url=config.api_url,
@@ -101,7 +111,7 @@ def run_harness(
             on_stream_token=on_stream_token,
             stream_tokens=config.stream,
         )
-        return answer
+        return HarnessResult(answer=answer, messages=msgs_out)
 
     if config.stream:
         full: List[str] = []
@@ -119,17 +129,19 @@ def run_harness(
             full.append(token)
             if on_stream_token:
                 on_stream_token(token)
-        return "".join(full)
+        return HarnessResult(answer="".join(full))
 
-    return chat_completion(
-        api_key=api_key,
-        messages=messages,  # type: ignore[arg-type]
-        model_mode=model_mode,
-        temperature=temperature,
-        timeout=timeout,
-        proxy_url=config.proxy_url,
-        api_url=config.api_url,
-        provider=config.provider,
+    return HarnessResult(
+        answer=chat_completion(
+            api_key=api_key,
+            messages=messages,  # type: ignore[arg-type]
+            model_mode=model_mode,
+            temperature=temperature,
+            timeout=timeout,
+            proxy_url=config.proxy_url,
+            api_url=config.api_url,
+            provider=config.provider,
+        )
     )
 
 

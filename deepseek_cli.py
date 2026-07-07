@@ -95,7 +95,7 @@ def _one_shot(
             model_mode=model_mode,
             config=cfg,
             on_stream_token=_emit if stream else None,
-        )
+        ).answer
     return chat_completion(
         api_key=api_key,
         messages=messages,

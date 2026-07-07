@@ -41,6 +41,7 @@ from deepseek_api import (
     PROVIDER_DEEPSEEK,
     PROVIDER_KIMI,
     PROVIDER_OLLAMA,
+    PROVIDER_LMSTUDIO,
     STREAM_TIMEOUT_DEFAULT,
     STREAM_TIMEOUT_UNLIMITED,
     StreamInterrupted,
@@ -125,7 +126,7 @@ class NovelAskWorker(QThread):
                 timeout=self.timeout,
                 should_stop=self.should_stop,
                 on_stream_token=self.chunk.emit if self.stream else None,
-            )
+            ).answer
             self.done.emit(answer)
         except StreamInterrupted:
             self.interrupted.emit()
@@ -141,10 +142,11 @@ class ModelsRefreshWorker(QThread):
     done = pyqtSignal(list, list)
     failed = pyqtSignal(str)
 
-    def __init__(self, *, proxy_url: Optional[str], ollama_ui_base: Optional[str]):
+    def __init__(self, *, proxy_url: Optional[str], ollama_ui_base: Optional[str], lmstudio_ui_base: Optional[str]):
         super().__init__()
         self.proxy_url = proxy_url
         self.ollama_ui_base = ollama_ui_base
+        self.lmstudio_ui_base = lmstudio_ui_base
 
     def run(self) -> None:
         try:
@@ -152,6 +154,7 @@ class ModelsRefreshWorker(QThread):
                 proxy_url=self.proxy_url,
                 timeout=60,
                 ollama_ui_base=self.ollama_ui_base,
+                lmstudio_ui_base=self.lmstudio_ui_base,
             )
             self.done.emit(entries, notes)
         except Exception as exc:
@@ -330,7 +333,11 @@ class NovelWriterWindow(QMainWindow):
         param_row.addWidget(QLabel("Ollama"))
         self.ollama_edit = QLineEdit()
         self.ollama_edit.setPlaceholderText("http://127.0.0.1:11434")
-        param_row.addWidget(self.ollama_edit, 1)
+        param_row.addWidget(self.ollama_edit)
+        param_row.addWidget(QLabel("LM Studio"))
+        self.lmstudio_edit = QLineEdit()
+        self.lmstudio_edit.setPlaceholderText("http://127.0.0.1:1234")
+        param_row.addWidget(self.lmstudio_edit, 1)
         layout.addLayout(param_row)
 
         btn_row = QHBoxLayout()
@@ -549,14 +556,17 @@ class NovelWriterWindow(QMainWindow):
             if not isinstance(item, (list, tuple)) or len(item) < 2:
                 continue
             prov, mid = str(item[0]), str(item[1])
-            tag = {"deepseek": "DS", "kimi": "Kimi", "ollama": "Ollama"}.get(prov, prov[:6])
+            tag = {"deepseek": "DS", "kimi": "Kimi", "ollama": "Ollama", "lmstudio": "LM Studio"}.get(prov, prov[:6])
             self.model_combo.addItem(f"[{tag}] {mid}", (prov, mid))
 
     def on_refresh_models(self) -> None:
         if self._models_worker and self._models_worker.isRunning():
             return
         ollama = self.ollama_edit.text().strip() or None
-        self._models_worker = ModelsRefreshWorker(proxy_url=self._proxy_url(), ollama_ui_base=ollama)
+        lmstudio = self.lmstudio_edit.text().strip() or None
+        self._models_worker = ModelsRefreshWorker(
+            proxy_url=self._proxy_url(), ollama_ui_base=ollama, lmstudio_ui_base=lmstudio
+        )
         self._models_worker.done.connect(self._on_models_done)
         self._models_worker.failed.connect(lambda m: QMessageBox.warning(self, "模型", m))
         self._models_worker.start()
@@ -702,6 +712,7 @@ class NovelWriterWindow(QMainWindow):
             api_key, api_url = resolve_chat_endpoint(
                 self.current_provider(),
                 ollama_ui_base=self.ollama_edit.text().strip() or None,
+                lmstudio_ui_base=self.lmstudio_edit.text().strip() or None,
             )
         except ValueError as exc:
             QMessageBox.critical(self, "API Key", str(exc))
