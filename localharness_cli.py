@@ -4,17 +4,17 @@ import urllib.error
 from pathlib import Path
 from typing import Optional
 
-from deepseek_api import (
+from localharness_api import (
     build_simple_messages,
     chat_completion,
     explain_http_error,
     get_api_key,
 )
-from deepseek_harness import HarnessConfig, run_harness
+from localharness_harness import HarnessConfig, run_harness
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="DeepSeek 命令行：普通对话或 --tools 本地工具 + 联网搜索。")
+    p = argparse.ArgumentParser(description="LocalHarness CLI：普通对话或 --tools 本地工具 + 联网搜索。")
     p.add_argument(
         "--tools",
         action="store_true",
@@ -107,7 +107,7 @@ def _one_shot(
 
 
 def _stream_then_join(api_key: str, messages, model_mode: str, proxy_url: Optional[str]) -> str:
-    from deepseek_api import chat_completion_stream
+    from localharness_api import chat_completion_stream
 
     chunks: list[str] = []
     for token in chat_completion_stream(
@@ -172,7 +172,7 @@ def main() -> int:
             print(ans)
         return 0
 
-    print("DeepSeek CLI ready. Type your question and press Enter.")
+    print("LocalHarness CLI ready. Type your question and press Enter.")
     print("Type 'exit' or 'quit' to stop.")
 
     while True:
@@ -203,7 +203,7 @@ def main() -> int:
             if use_tools and stream:
                 sys.stdout.write("\n")
             elif use_tools or args.no_stream:
-                print(f"\nDeepSeek: {ans}")
+                print(f"\nAssistant: {ans}")
             else:
                 print()
         except urllib.error.HTTPError as exc:

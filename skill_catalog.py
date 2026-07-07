@@ -56,7 +56,7 @@ def _build_opener(proxy_url: Optional[str]):
 
 
 def _http_get_json(url: str, *, proxy_url: Optional[str]) -> Any:
-    req = urllib.request.Request(url, headers={"User-Agent": "deepseek-pyqt-assistant/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "localharness/1.0"})
     opener = _build_opener(proxy_url)
     with opener.open(req, timeout=REQUEST_TIMEOUT) as resp:
         raw = resp.read().decode("utf-8", errors="replace")
@@ -151,7 +151,7 @@ class SkillCatalog:
     def download_skill_md(self, slug: str) -> Tuple[str, Optional[str]]:
         url = self.skill_download_url(slug)
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "deepseek-pyqt-assistant/1.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "localharness/1.0"})
             opener = _build_opener(self.proxy_url)
             with opener.open(req, timeout=REQUEST_TIMEOUT) as resp:
                 data = resp.read()

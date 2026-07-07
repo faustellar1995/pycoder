@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence
 
-from novelwriter_assets import (
+from .assets import (
     ASSET_CHARACTER,
     ASSET_EVENT,
     ASSET_STORY_MODE,
@@ -12,7 +12,7 @@ from novelwriter_assets import (
     CATEGORY_LABELS,
     NovelAsset,
 )
-from novelwriter_prompts import PromptBlock, ROLE_LABELS
+from .prompts import PromptBlock, ROLE_LABELS
 
 
 def _section(title: str, body: str) -> str:

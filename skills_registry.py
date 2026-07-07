@@ -105,16 +105,21 @@ class LoadedSkill:
 
 
 def default_skill_scan_dirs() -> List[Path]:
-    base = Path(os.getenv("DEEPSEEK_SKILLS_HOME", "")).expanduser()
+    base = Path(
+        os.getenv("LOCALHARNESS_SKILLS_HOME") or os.getenv("DEEPSEEK_SKILLS_HOME", "")
+    ).expanduser()
     dirs: List[Path] = []
-    extra = os.getenv("DEEPSEEK_SKILL_DIRS", "")
+    extra = os.getenv("LOCALHARNESS_SKILL_DIRS") or os.getenv("DEEPSEEK_SKILL_DIRS", "")
     if extra:
         for part in extra.split(os.pathsep):
             p = Path(part.strip()).expanduser()
             if p:
                 dirs.append(p.resolve())
-    home_skills = Path.home() / ".deepseek-assistant" / "skills"
+    home_skills = Path.home() / ".localharness" / "skills"
+    legacy_home = Path.home() / ".deepseek-assistant" / "skills"
     dirs.append(home_skills)
+    if legacy_home != home_skills:
+        dirs.append(legacy_home)
     cwd_skills = Path.cwd() / "skills"
     dirs.append(cwd_skills.resolve())
     if base:

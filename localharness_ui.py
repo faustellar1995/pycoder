@@ -43,7 +43,7 @@ from PyQt5.QtWidgets import (
     QInputDialog,
 )
 
-from deepseek_api import (
+from localharness_api import (
     API_URL,
     PROVIDER_DEEPSEEK,
     PROVIDER_KIMI,
@@ -74,7 +74,7 @@ from deepseek_api import (
     redact_messages_for_preview,
 )
 from markdown_renderer import markdown_to_html
-from deepseek_harness import (
+from localharness_harness import (
     HarnessConfig,
     do_git_commit,
     generate_git_commit_message,
@@ -554,7 +554,7 @@ class SkillMarketDialog(QDialog):
         self.detail.setFixedHeight(96)
         layout.addWidget(self.detail)
 
-        self.install_btn = QPushButton("安装选中技能到 ~/.deepseek-assistant/skills")
+        self.install_btn = QPushButton("安装选中技能到 ~/.localharness/skills")
         layout.addWidget(self.install_btn)
 
         self.search_btn.clicked.connect(self.on_search)
@@ -636,7 +636,7 @@ class SkillMarketDialog(QDialog):
                 )
                 return
         safe = slug.replace("/", "_").replace("\\", "_")
-        dest_dir = Path.home() / ".deepseek-assistant" / "skills" / safe
+        dest_dir = Path.home() / ".localharness" / "skills" / safe
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / "SKILL.md"
         dest.write_text(raw, encoding="utf-8", newline="\n")
@@ -771,7 +771,7 @@ class ModelsRefreshWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("DeepSeek Multi-turn Chat with System Prompt")
+        self.setWindowTitle("LocalHarness — Multi-model Chat")
         self.setAcceptDrops(True)
         self.resize(900, 750)
 
@@ -793,7 +793,7 @@ class MainWindow(QMainWindow):
         self._chat_thumb_cache: Dict[str, Tuple[str, int, int]] = {}
         self.logs_dir = Path("./logs")
         self.logs_dir.mkdir(parents=True, exist_ok=True)
-        self.settings = QSettings("DeepSeekAssistant", "PyQtClient")
+        self.settings = QSettings("LocalHarness", "PyQtClient")
         self._skill_catalog = []
         self._preview_debounce = QTimer(self)
         self._preview_debounce.setSingleShot(True)
@@ -2332,7 +2332,7 @@ class MainWindow(QMainWindow):
         return base
 
     def _next_request_preview_payload(self) -> Dict[str, Any]:
-        """下一次 POST 与 deepseek_api / harness 对齐的摘要（便于调 prompt）。"""
+        """下一次 POST 与 localharness_api / harness 对齐的摘要（便于调 prompt）。"""
         next_user = self.input_box.toPlainText().strip()
         msgs = self._build_next_request_messages(next_user)
         prov = self.current_provider()

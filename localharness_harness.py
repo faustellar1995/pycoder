@@ -1,4 +1,4 @@
-"""DeepSeek harness：将对话执行逻辑从 UI 分离。
+"""LocalHarness：将对话执行逻辑从 UI 分离。
 
 - 非流式：普通 chat completion
 - 流式：SSE 增量 token
@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import subprocess
 
-from deepseek_api import (
+from localharness_api import (
     API_URL,
     PROVIDER_DEEPSEEK,
     StreamInterrupted,

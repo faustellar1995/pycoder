@@ -16,7 +16,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 def default_workspace_root() -> Path:
-    return Path(os.getenv("DEEPSEEK_WORKSPACE", os.getcwd())).resolve()
+    return Path(
+        os.getenv("LOCALHARNESS_WORKSPACE") or os.getenv("DEEPSEEK_WORKSPACE", os.getcwd())
+    ).resolve()
 
 
 def parse_extra_workspace_roots() -> Tuple[Path, ...]:

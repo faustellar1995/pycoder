@@ -36,7 +36,7 @@ from PyQt5.QtWidgets import (
     QListWidgetItem,
 )
 
-from deepseek_api import (
+from localharness_api import (
     API_URL,
     PROVIDER_DEEPSEEK,
     PROVIDER_KIMI,
@@ -52,9 +52,9 @@ from deepseek_api import (
     resolve_chat_endpoint,
     resolve_model,
 )
-from deepseek_harness import HarnessConfig, run_harness
+from localharness_harness import HarnessConfig, run_harness
 from markdown_renderer import markdown_to_html
-from novelwriter_assets import (
+from .assets import (
     ASSET_CHARACTER,
     ASSET_EVENT,
     ASSET_STORY_MODE,
@@ -65,9 +65,9 @@ from novelwriter_assets import (
     NovelAsset,
     default_assets_root,
 )
-from novelwriter_compose import build_chat_messages, compose_system_prompt, preview_payload
-from novelwriter_dialogs import AssetEditDialog, PromptBlockEditDialog
-from novelwriter_prompts import PromptBlock, PromptStore
+from .compose import build_chat_messages, compose_system_prompt, preview_payload
+from .dialogs import AssetEditDialog, PromptBlockEditDialog
+from .prompts import PromptBlock, PromptStore
 
 
 class NovelAskWorker(QThread):
@@ -901,7 +901,3 @@ def main() -> int:
     win = NovelWriterWindow()
     win.show()
     return app.exec_()
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

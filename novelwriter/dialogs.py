@@ -16,8 +16,8 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
 )
 
-from novelwriter_assets import ASSET_TYPES, CATEGORY_LABELS, NovelAsset
-from novelwriter_prompts import PROMPT_ROLES, ROLE_LABELS, PromptBlock
+from .assets import ASSET_TYPES, CATEGORY_LABELS, NovelAsset
+from .prompts import PROMPT_ROLES, ROLE_LABELS, PromptBlock
 
 
 class AssetEditDialog(QDialog):
